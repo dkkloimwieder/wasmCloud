@@ -60,6 +60,117 @@ impl wasmtime_wasi_tls::TlsProvider for SharedTlsProvider {
     }
 }
 
+/// wamn carried patch: per-store memory budget, enforced via
+/// [`wasmtime::Store::limiter`]. The pooling allocator's `max_memory_size` is
+/// the *platform ceiling* (pre-sizes pool slots, uniform per engine); this
+/// limiter enforces the *per-component budget* below it. Wasmtime consults
+/// `memory_growing` on initial memory creation and on every `memory.grow`, so
+/// a denied grow fails in-guest (allocator abort -> trap), and a component
+/// whose baseline already exceeds its budget fails at instantiation.
+///
+/// v0 semantics: the budget applies to EACH linear memory, not cumulatively
+/// across a store's memories (single-memory components are the overwhelming
+/// case; revisit if multi-memory artifacts appear). A budget larger than the
+/// host ceiling is a hard error at store creation (never a silent clamp),
+/// checked in `new_store_from_templates` against the host-advertised
+/// `WAMN_MEMORY_CEILING_MB` env var — the pooling cap is not introspectable
+/// from the engine, and `memory_growing`'s `maximum` parameter carries only
+/// the memory's declared max, not the allocator's. With no budget configured
+/// the limiter is never attached, so unbudgeted stores behave byte-identically
+/// to upstream.
+pub struct WamnStoreLimiter {
+    /// Budget in bytes for each linear memory. `None` = unlimited (the field
+    /// exists so `SharedCtx` construction stays uniform; an unlimited limiter
+    /// is never attached to the store).
+    budget_bytes: Option<usize>,
+    /// Component the budget belongs to, for denial logs.
+    component_id: Arc<str>,
+    /// Denied grow attempts (never silent — each is logged and counted).
+    denied: u64,
+    /// Largest linear-memory size the store reached (bytes).
+    high_water: usize,
+}
+
+/// Defense-in-depth cap on table growth for budgeted stores (elements, one
+/// pointer each). The pooling allocator bounds tables independently; this
+/// closes the gap for non-pooling engines.
+const WAMN_TABLE_ELEMENTS_CAP: usize = 500_000;
+
+impl Default for WamnStoreLimiter {
+    fn default() -> Self {
+        Self {
+            budget_bytes: None,
+            component_id: Arc::from(""),
+            denied: 0,
+            high_water: 0,
+        }
+    }
+}
+
+impl WamnStoreLimiter {
+    pub fn new(budget_bytes: usize, component_id: Arc<str>) -> Self {
+        Self {
+            budget_bytes: Some(budget_bytes),
+            component_id,
+            denied: 0,
+            high_water: 0,
+        }
+    }
+}
+
+impl wasmtime::ResourceLimiter for WamnStoreLimiter {
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        // NOT the allocator ceiling: this is the memory's declared maximum
+        // (None when undeclared — the common case; the pooling cap is
+        // enforced after the limiter, not surfaced here). The budget-vs-
+        // ceiling strictness check therefore lives at store creation against
+        // the host-advertised WAMN_MEMORY_CEILING_MB, not on this parameter.
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        let Some(budget) = self.budget_bytes else {
+            self.high_water = self.high_water.max(desired);
+            return Ok(true);
+        };
+        if desired > budget {
+            self.denied += 1;
+            tracing::warn!(
+                target: "wamn::memory",
+                component = %self.component_id,
+                desired_bytes = desired,
+                budget_bytes = budget,
+                denied_total = self.denied,
+                "linear memory grow denied: exceeds wamn memory budget"
+            );
+            return Ok(false);
+        }
+        self.high_water = self.high_water.max(desired);
+        Ok(true)
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        if desired > WAMN_TABLE_ELEMENTS_CAP {
+            self.denied += 1;
+            tracing::warn!(
+                target: "wamn::memory",
+                component = %self.component_id,
+                desired_elements = desired,
+                cap_elements = WAMN_TABLE_ELEMENTS_CAP,
+                "table grow denied: exceeds wamn table cap"
+            );
+            return Ok(false);
+        }
+        Ok(true)
+    }
+}
+
 /// Shared context for linked components
 pub struct SharedCtx {
     /// Current active context
@@ -71,6 +182,10 @@ pub struct SharedCtx {
     /// Store-owned linked-component instances, keyed by component id.
     /// Dropping the store reclaims the instances without external cleanup.
     pub exporter_instances: HashMap<Arc<str>, Instance>,
+    /// wamn carried patch: per-store memory budget (see [`WamnStoreLimiter`]).
+    /// Lives in the store data because [`wasmtime::Store::limiter`] projects
+    /// the limiter out of `T`.
+    pub wamn_limiter: WamnStoreLimiter,
 }
 
 impl SharedCtx {
@@ -80,6 +195,7 @@ impl SharedCtx {
             table: ResourceTable::new(),
             contexts: Default::default(),
             exporter_instances: Default::default(),
+            wamn_limiter: WamnStoreLimiter::default(),
         }
     }
 

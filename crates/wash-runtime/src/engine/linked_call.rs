@@ -34,7 +34,9 @@ use wasmtime_wasi::WasiCtxBuilder;
 
 #[cfg(feature = "wasi-tls")]
 use crate::engine::ctx::SharedTlsProvider;
-use crate::engine::ctx::{AccessorActiveCtxGuard, Ctx, SharedCtx, StoreActiveCtxGuard};
+use crate::engine::ctx::{
+    AccessorActiveCtxGuard, Ctx, SharedCtx, StoreActiveCtxGuard, WamnStoreLimiter,
+};
 use crate::engine::value::{carries_cross_store_handle, lift_results, lower_params};
 use crate::engine::volumes::{ResolvedVolumeMount, resolve_component_volume_mounts_in_map};
 use crate::engine::workload::{WorkloadComponent, WorkloadMetadata};
@@ -277,6 +279,51 @@ pub(crate) async fn new_store_from_templates(
         })
         .unwrap_or(u64::MAX / 2);
     store.set_epoch_deadline(epoch_deadline_ticks);
+
+    // wamn carried patch: per-component linear-memory budget, enforced below
+    // the pooling allocator's engine-wide ceiling via `Store::limiter` (see
+    // `WamnStoreLimiter`). Resolution order: the workload spec's first-class
+    // `memory_limit_mb` (<= 0 means unset upstream), then the active
+    // component's `wamn.memory-limit-mb` config, then the
+    // WAMN_MEMORY_LIMIT_MB env var. With no budget configured no limiter is
+    // attached — unbudgeted stores are byte-identical to upstream.
+    let memory_budget_mb = (active.local_resources.memory_limit_mb > 0)
+        .then_some(active.local_resources.memory_limit_mb as u64)
+        .or_else(|| {
+            active
+                .local_resources
+                .config
+                .get("wamn.memory-limit-mb")
+                .and_then(|v| v.parse::<u64>().ok())
+        })
+        .or_else(|| {
+            std::env::var("WAMN_MEMORY_LIMIT_MB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+        });
+    if let Some(mb) = memory_budget_mb {
+        // A budget above the host ceiling is a hard configuration error,
+        // never a silent clamp. The ceiling is advertised by the embedding
+        // host via WAMN_MEMORY_CEILING_MB (the pooling allocator's
+        // max_memory_size is not introspectable from the engine); hosts that
+        // do not advertise one skip the check.
+        if let Some(ceiling_mb) = std::env::var("WAMN_MEMORY_CEILING_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            if mb > ceiling_mb {
+                anyhow::bail!(
+                    "component '{}': wamn memory budget {mb} MiB exceeds the host ceiling \
+                     {ceiling_mb} MiB (pooling max_memory_size); lower the budget or raise \
+                     the ceiling",
+                    active.component_id,
+                );
+            }
+        }
+        store.data_mut().wamn_limiter =
+            WamnStoreLimiter::new((mb as usize) << 20, active.component_id.clone());
+        store.limiter(|ctx| &mut ctx.wamn_limiter);
+    }
 
     let active_id = active.component_id.clone();
     for (linked_id, linked_pre) in linked_instances {
