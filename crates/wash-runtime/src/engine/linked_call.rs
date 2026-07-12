@@ -258,6 +258,26 @@ pub(crate) async fn new_store_from_templates(
 
     let mut store = wasmtime::Store::new(engine, shared_ctx);
 
+    // wamn carried patch: stores default to an epoch deadline of 0, so a host
+    // that enables `Config::epoch_interruption` and drives
+    // `Engine::increment_epoch` would trap every guest on the first tick.
+    // Give each store a deadline in engine epoch ticks: the active
+    // component's `wamn.epoch-deadline-ticks` config wins, then the
+    // WAMN_EPOCH_DEADLINE_TICKS env var, then effectively-unbounded
+    // (u64::MAX would wrap in wasmtime's `current_epoch + delta`).
+    let epoch_deadline_ticks = active
+        .local_resources
+        .config
+        .get("wamn.epoch-deadline-ticks")
+        .and_then(|v| v.parse::<u64>().ok())
+        .or_else(|| {
+            std::env::var("WAMN_EPOCH_DEADLINE_TICKS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+        })
+        .unwrap_or(u64::MAX / 2);
+    store.set_epoch_deadline(epoch_deadline_ticks);
+
     let active_id = active.component_id.clone();
     for (linked_id, linked_pre) in linked_instances {
         store.data_mut().set_active_ctx(linked_id)?;
