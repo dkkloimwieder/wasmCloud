@@ -345,6 +345,28 @@ impl OutgoingHandler for DefaultOutgoingHandler {
         // `default_send_request`) so the request can be wrapped in a client
         // span and the response status recorded once it arrives.
         let span = outbound_client_span(request.method(), request.uri());
+        // wamn(9.2): stamp the current W3C trace context onto the outbound
+        // request so the downstream continues this trace across a process
+        // boundary. This is host-enforced: every outbound `wasi:http` call
+        // flows through this handler regardless of whether the guest used an
+        // SDK, so an SDK-bypassing custom node cannot break trace continuity.
+        // The inbound side already *extracts* `traceparent` (see
+        // `handle_http_request` in this file); this is the symmetric outbound
+        // *inject*. Injecting the client span's context parents the downstream
+        // span under it (standard OTel HTTP client -> server semantics). When
+        // observability is off the global propagator is a no-op, so no header
+        // is added — byte-identical to upstream.
+        let mut request = request;
+        {
+            use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+            let cx = span.context();
+            opentelemetry::global::get_text_map_propagator(|propagator| {
+                propagator.inject_context(
+                    &cx,
+                    &mut opentelemetry_http::HeaderInjector(request.headers_mut()),
+                );
+            });
+        }
         let handle = wasmtime_wasi::runtime::spawn(
             async move {
                 let result =
