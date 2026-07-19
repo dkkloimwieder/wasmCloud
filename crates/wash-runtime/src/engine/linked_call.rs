@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::RwLock;
@@ -175,16 +176,60 @@ async fn build_ctx_from_template(
         .inherit_stdout()
         .inherit_stderr();
 
+    // wamn carried patch: `wasi:sockets` is linked into every component
+    // unconditionally (see `engine/mod.rs`), and the parsed egress allowlist
+    // (`allowed_hosts`) governs the `wasi:http` path only. `TcpConnect` reaches
+    // this check with a post-DNS `SocketAddr`, not a name, so allowlist matching
+    // cannot be applied here without hooking `ip_name_lookup` (name->IP
+    // allowlists are fragile). Instead, deny raw outbound TCP unless the
+    // workload explicitly opts in: the component's `wamn.allow-raw-sockets`
+    // config wins, then the `WAMN_ALLOW_RAW_SOCKETS` env var, else DENY. An
+    // unparseable value denies (this is a security floor). The default-deny is
+    // visible: on the first denial we `warn!` once per component so an operator
+    // can diagnose a blocked node. The other arms are unchanged (upstream
+    // behavior): `TcpBind` is service-loopback-only, `UdpBind` loopback/
+    // unspecified, and outbound UDP (`UdpConnect`/`UdpOutgoingDatagram`) is
+    // still allowed — outbound UDP is a separate hole, tracked separately.
+    let allow_raw_sockets = template
+        .local_resources
+        .config
+        .get("wamn.allow-raw-sockets")
+        .map(|v| v.parse::<bool>().unwrap_or(false))
+        .or_else(|| {
+            std::env::var("WAMN_ALLOW_RAW_SOCKETS")
+                .ok()
+                .map(|v| v.parse::<bool>().unwrap_or(false))
+        })
+        .unwrap_or(false);
+    let raw_socket_component = template.component_id.clone();
+    let raw_socket_denial_logged = Arc::new(AtomicBool::new(false));
+
     let sockets_ctx = sockets::WasiSocketsCtx {
         socket_addr_check: sockets::SocketAddrCheck::new(move |addr, reason| {
+            let raw_socket_component = raw_socket_component.clone();
+            let raw_socket_denial_logged = raw_socket_denial_logged.clone();
             Box::pin(async move {
                 match reason {
                     SocketAddrUse::TcpBind if is_service => addr.ip().is_loopback(),
                     SocketAddrUse::TcpBind => false,
                     SocketAddrUse::UdpBind => addr.ip().is_loopback() || addr.ip().is_unspecified(),
-                    SocketAddrUse::TcpConnect
-                    | SocketAddrUse::UdpConnect
-                    | SocketAddrUse::UdpOutgoingDatagram => true,
+                    SocketAddrUse::TcpConnect => {
+                        if !allow_raw_sockets
+                            && !raw_socket_denial_logged.swap(true, Ordering::Relaxed)
+                        {
+                            tracing::warn!(
+                                target: "wamn::sockets",
+                                component = %raw_socket_component,
+                                addr = %addr,
+                                "wasi:sockets TcpConnect denied: workload has not opted into \
+                                 raw sockets (set wamn.allow-raw-sockets=true or \
+                                 WAMN_ALLOW_RAW_SOCKETS=true); egress allowlists govern \
+                                 wasi:http only"
+                            );
+                        }
+                        allow_raw_sockets
+                    }
+                    SocketAddrUse::UdpConnect | SocketAddrUse::UdpOutgoingDatagram => true,
                 }
             })
         }),
