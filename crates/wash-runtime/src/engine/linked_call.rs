@@ -155,6 +155,57 @@ pub(crate) fn func_is_ephemeral_safe(func_ty: &ComponentFunc) -> bool {
         && func_ty.results().all(|ty| type_is_ephemeral_safe(&ty))
 }
 
+/// wamn carried patch: resolve the raw-sockets opt-in for a component.
+///
+/// The component's `wamn.allow-raw-sockets` config wins, then the
+/// `WAMN_ALLOW_RAW_SOCKETS` env var, else DENY. An unparseable value denies
+/// (this is a security floor). Pulled out of `build_ctx_from_template` so the
+/// precedence and parse-fail-closed behavior are unit-testable without touching
+/// process env. The precedent is the carried epoch/memory-limiter config reads.
+fn resolve_allow_raw_sockets(config: Option<&str>, env: Option<&str>) -> bool {
+    config
+        .map(|v| v.parse::<bool>().unwrap_or(false))
+        .or_else(|| env.map(|v| v.parse::<bool>().unwrap_or(false)))
+        .unwrap_or(false)
+}
+
+/// wamn carried patch: the `socket_addr_check` policy, as a pure decision.
+///
+/// `wasi:sockets` is linked into every component unconditionally (see
+/// `engine/mod.rs`) and the parsed egress allowlist (`allowed_hosts`) governs
+/// the `wasi:http` path only, so a guest could otherwise open a raw socket to
+/// any post-DNS address and bypass egress policy. This is the platform-plan 8.2
+/// deny-all posture at this layer:
+///
+/// - **Bind** (`TcpBind`/`UdpBind`): only a service component may bind, and only
+///   to loopback; every non-service bind and every non-loopback bind is denied.
+/// - **Raw egress** (`TcpConnect`/`UdpConnect`/`UdpOutgoingDatagram`): denied
+///   unless the workload opts in via `allow_raw_sockets`. These reach the check
+///   with a post-DNS `SocketAddr`, not a name, so allowlist matching cannot be
+///   applied here without hooking `ip_name_lookup` (name->IP allowlists are
+///   fragile); a binary deny-unless-opt-in is the honest policy at this layer.
+fn socket_addr_permitted(
+    reason: SocketAddrUse,
+    ip_is_loopback: bool,
+    is_service: bool,
+    allow_raw_sockets: bool,
+) -> bool {
+    match reason {
+        SocketAddrUse::TcpBind | SocketAddrUse::UdpBind => is_service && ip_is_loopback,
+        SocketAddrUse::TcpConnect
+        | SocketAddrUse::UdpConnect
+        | SocketAddrUse::UdpOutgoingDatagram => allow_raw_sockets,
+    }
+}
+
+/// True for the raw outbound-egress socket uses gated by `allow_raw_sockets`.
+fn is_raw_egress(reason: SocketAddrUse) -> bool {
+    matches!(
+        reason,
+        SocketAddrUse::TcpConnect | SocketAddrUse::UdpConnect | SocketAddrUse::UdpOutgoingDatagram
+    )
+}
+
 async fn build_ctx_from_template(
     template: &ComponentCtxTemplate,
     http_handler: Arc<dyn crate::host::http::HostHandler>,
@@ -178,29 +229,25 @@ async fn build_ctx_from_template(
 
     // wamn carried patch: `wasi:sockets` is linked into every component
     // unconditionally (see `engine/mod.rs`), and the parsed egress allowlist
-    // (`allowed_hosts`) governs the `wasi:http` path only. `TcpConnect` reaches
-    // this check with a post-DNS `SocketAddr`, not a name, so allowlist matching
-    // cannot be applied here without hooking `ip_name_lookup` (name->IP
-    // allowlists are fragile). Instead, deny raw outbound TCP unless the
-    // workload explicitly opts in: the component's `wamn.allow-raw-sockets`
-    // config wins, then the `WAMN_ALLOW_RAW_SOCKETS` env var, else DENY. An
-    // unparseable value denies (this is a security floor). The default-deny is
-    // visible: on the first denial we `warn!` once per component so an operator
-    // can diagnose a blocked node. The other arms are unchanged (upstream
-    // behavior): `TcpBind` is service-loopback-only, `UdpBind` loopback/
-    // unspecified, and outbound UDP (`UdpConnect`/`UdpOutgoingDatagram`) is
-    // still allowed — outbound UDP is a separate hole, tracked separately.
-    let allow_raw_sockets = template
-        .local_resources
-        .config
-        .get("wamn.allow-raw-sockets")
-        .map(|v| v.parse::<bool>().unwrap_or(false))
-        .or_else(|| {
-            std::env::var("WAMN_ALLOW_RAW_SOCKETS")
-                .ok()
-                .map(|v| v.parse::<bool>().unwrap_or(false))
-        })
-        .unwrap_or(false);
+    // (`allowed_hosts`) governs the `wasi:http` path only. So a guest could open
+    // a raw socket to any post-DNS address and bypass egress policy entirely.
+    // The policy is factored into `socket_addr_permitted` (bind is
+    // service-loopback-only; raw egress -- `TcpConnect`/`UdpConnect`/
+    // `UdpOutgoingDatagram` -- is denied unless the workload opts in) and the
+    // opt-in into `resolve_allow_raw_sockets` (config > env > DENY, unparseable
+    // denies -- a security floor). The default-deny is visible: on the first raw
+    // egress denial we `warn!` once per component so an operator can diagnose a
+    // blocked node. Follow-up to the `TcpConnect`-only opt-in: `UdpConnect`/
+    // `UdpOutgoingDatagram` now share the same gate, and `UdpBind` is tightened
+    // from loopback-or-unspecified-for-any-component to match `TcpBind`.
+    let allow_raw_sockets = resolve_allow_raw_sockets(
+        template
+            .local_resources
+            .config
+            .get("wamn.allow-raw-sockets")
+            .map(String::as_str),
+        std::env::var("WAMN_ALLOW_RAW_SOCKETS").ok().as_deref(),
+    );
     let raw_socket_component = template.component_id.clone();
     let raw_socket_denial_logged = Arc::new(AtomicBool::new(false));
 
@@ -209,28 +256,28 @@ async fn build_ctx_from_template(
             let raw_socket_component = raw_socket_component.clone();
             let raw_socket_denial_logged = raw_socket_denial_logged.clone();
             Box::pin(async move {
-                match reason {
-                    SocketAddrUse::TcpBind if is_service => addr.ip().is_loopback(),
-                    SocketAddrUse::TcpBind => false,
-                    SocketAddrUse::UdpBind => addr.ip().is_loopback() || addr.ip().is_unspecified(),
-                    SocketAddrUse::TcpConnect => {
-                        if !allow_raw_sockets
-                            && !raw_socket_denial_logged.swap(true, Ordering::Relaxed)
-                        {
-                            tracing::warn!(
-                                target: "wamn::sockets",
-                                component = %raw_socket_component,
-                                addr = %addr,
-                                "wasi:sockets TcpConnect denied: workload has not opted into \
-                                 raw sockets (set wamn.allow-raw-sockets=true or \
-                                 WAMN_ALLOW_RAW_SOCKETS=true); egress allowlists govern \
-                                 wasi:http only"
-                            );
-                        }
-                        allow_raw_sockets
-                    }
-                    SocketAddrUse::UdpConnect | SocketAddrUse::UdpOutgoingDatagram => true,
+                let permitted = socket_addr_permitted(
+                    reason,
+                    addr.ip().is_loopback(),
+                    is_service,
+                    allow_raw_sockets,
+                );
+                if !permitted
+                    && is_raw_egress(reason)
+                    && !raw_socket_denial_logged.swap(true, Ordering::Relaxed)
+                {
+                    tracing::warn!(
+                        target: "wamn::sockets",
+                        component = %raw_socket_component,
+                        addr = %addr,
+                        reason = ?reason,
+                        "wasi:sockets raw egress denied: workload has not opted into \
+                         raw sockets (set wamn.allow-raw-sockets=true or \
+                         WAMN_ALLOW_RAW_SOCKETS=true); egress allowlists govern \
+                         wasi:http only"
+                    );
                 }
+                permitted
             })
         }),
         loopback: Arc::clone(&template.loopback),
@@ -685,4 +732,214 @@ pub(crate) async fn invoke_linked_sync_export(
         Ok(())
     }
     .await
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    // --- resolve_allow_raw_sockets: config > env > DENY; unparseable denies ---
+
+    #[test]
+    fn raw_sockets_denied_by_default() {
+        assert!(!resolve_allow_raw_sockets(None, None));
+    }
+
+    #[test]
+    fn raw_sockets_config_true_allows() {
+        assert!(resolve_allow_raw_sockets(Some("true"), None));
+    }
+
+    #[test]
+    fn raw_sockets_config_false_denies() {
+        assert!(!resolve_allow_raw_sockets(Some("false"), None));
+    }
+
+    #[test]
+    fn raw_sockets_env_true_allows_when_config_absent() {
+        assert!(resolve_allow_raw_sockets(None, Some("true")));
+    }
+
+    #[test]
+    fn raw_sockets_config_wins_over_env() {
+        // A present config value short-circuits the env fallback: config `false`
+        // denies even when the env var says `true`.
+        assert!(!resolve_allow_raw_sockets(Some("false"), Some("true")));
+    }
+
+    #[test]
+    fn raw_sockets_unparseable_config_denies() {
+        // Security floor: an unparseable config value denies (and, being present,
+        // does not fall through to the env var).
+        assert!(!resolve_allow_raw_sockets(Some("yes"), Some("true")));
+    }
+
+    #[test]
+    fn raw_sockets_unparseable_env_denies() {
+        assert!(!resolve_allow_raw_sockets(None, Some("1")));
+    }
+
+    // --- socket_addr_permitted: bind posture ---
+
+    #[test]
+    fn tcp_bind_service_loopback_allowed() {
+        assert!(socket_addr_permitted(
+            SocketAddrUse::TcpBind,
+            true,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn tcp_bind_service_non_loopback_denied() {
+        assert!(!socket_addr_permitted(
+            SocketAddrUse::TcpBind,
+            false,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn tcp_bind_non_service_denied() {
+        assert!(!socket_addr_permitted(
+            SocketAddrUse::TcpBind,
+            true,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn udp_bind_service_loopback_allowed() {
+        // UdpBind now mirrors TcpBind (was loopback-or-unspecified for every
+        // component -- the E16 asymmetry).
+        assert!(socket_addr_permitted(
+            SocketAddrUse::UdpBind,
+            true,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn udp_bind_service_non_loopback_denied() {
+        assert!(!socket_addr_permitted(
+            SocketAddrUse::UdpBind,
+            false,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn udp_bind_non_service_denied() {
+        // Previously a non-service component could bind 0.0.0.0/loopback UDP; now
+        // denied, matching TcpBind's non-service arm.
+        assert!(!socket_addr_permitted(
+            SocketAddrUse::UdpBind,
+            true,
+            false,
+            false
+        ));
+    }
+
+    // --- socket_addr_permitted: raw egress opt-in (TCP + UDP) ---
+
+    #[test]
+    fn tcp_connect_denied_by_default() {
+        assert!(!socket_addr_permitted(
+            SocketAddrUse::TcpConnect,
+            false,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn tcp_connect_allowed_when_opted_in() {
+        assert!(socket_addr_permitted(
+            SocketAddrUse::TcpConnect,
+            false,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn udp_connect_denied_by_default() {
+        // E15: raw UDP egress was allowed unconditionally; now gated.
+        assert!(!socket_addr_permitted(
+            SocketAddrUse::UdpConnect,
+            false,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn udp_connect_allowed_when_opted_in() {
+        assert!(socket_addr_permitted(
+            SocketAddrUse::UdpConnect,
+            false,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn udp_outgoing_datagram_denied_by_default() {
+        assert!(!socket_addr_permitted(
+            SocketAddrUse::UdpOutgoingDatagram,
+            false,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn udp_outgoing_datagram_allowed_when_opted_in() {
+        assert!(socket_addr_permitted(
+            SocketAddrUse::UdpOutgoingDatagram,
+            false,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn opt_in_does_not_widen_bind() {
+        // The raw-egress opt-in must not relax the bind posture.
+        assert!(!socket_addr_permitted(
+            SocketAddrUse::UdpBind,
+            false,
+            true,
+            true
+        ));
+        assert!(!socket_addr_permitted(
+            SocketAddrUse::UdpBind,
+            true,
+            false,
+            true
+        ));
+        assert!(!socket_addr_permitted(
+            SocketAddrUse::TcpBind,
+            false,
+            true,
+            true
+        ));
+    }
+
+    // --- is_raw_egress: only the outbound-egress uses drive the warn-once ---
+
+    #[test]
+    fn is_raw_egress_classifies_only_egress() {
+        assert!(is_raw_egress(SocketAddrUse::TcpConnect));
+        assert!(is_raw_egress(SocketAddrUse::UdpConnect));
+        assert!(is_raw_egress(SocketAddrUse::UdpOutgoingDatagram));
+        assert!(!is_raw_egress(SocketAddrUse::TcpBind));
+        assert!(!is_raw_egress(SocketAddrUse::UdpBind));
+    }
 }
