@@ -1136,9 +1136,37 @@ async fn handle_http_request<T: Router>(
     Ok(response)
 }
 
+/// Inbound HTTP requests served by the host, counted by status class. A wamn
+/// 9.8 host metric on the global meter (a no-op until `initialize_observability`
+/// installs a provider), symmetric to the `fuel.consumption` histogram: the host
+/// owns the HTTP server, so this is the one seam that sees every generated-API
+/// request — the `ProxyPre` bench path bypasses this server, so it is only
+/// exercised against the real deployed handler.
+static WAMN_API_REQUESTS: std::sync::LazyLock<opentelemetry::metrics::Counter<u64>> =
+    std::sync::LazyLock::new(|| {
+        opentelemetry::global::meter("wamn-host")
+            .u64_counter("wamn.api.requests")
+            .with_description("Inbound HTTP requests served by the host, by status class")
+            .build()
+    });
+
+/// Map an HTTP status code to its class label for the `wamn.api.requests`
+/// `status_class` attribute — bounded cardinality (never the raw code).
+fn http_status_class(status: u16) -> &'static str {
+    match status / 100 {
+        1 => "1xx",
+        2 => "2xx",
+        3 => "3xx",
+        4 => "4xx",
+        _ => "5xx",
+    }
+}
+
 /// Record the response's status on the current span as the OTel HTTP semconv
 /// attribute `http.response.status_code`. 5xx flips `otel.status_code` to
-/// `ERROR` per the HTTP semconv (4xx is a client error and stays UNSET).
+/// `ERROR` per the HTTP semconv (4xx is a client error and stays UNSET). Also
+/// the single choke point for the `wamn.api.requests` counter — called once per
+/// served request (normal invoke + the routing-failure early returns).
 fn record_response_status<B>(response: &hyper::Response<B>) {
     let status = response.status().as_u16();
     let span = tracing::Span::current();
@@ -1146,6 +1174,7 @@ fn record_response_status<B>(response: &hyper::Response<B>) {
     if status >= 500 {
         span.record(OTEL_STATUS_CODE, "ERROR");
     }
+    WAMN_API_REQUESTS.add(1, &[KeyValue::new("status_class", http_status_class(status))]);
 }
 
 /// Build a `client` span for an outbound HTTP request following the OTel HTTP

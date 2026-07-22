@@ -116,6 +116,32 @@ impl WamnStoreLimiter {
             high_water: 0,
         }
     }
+
+    /// The component this limiter's budget belongs to (empty for the default,
+    /// unbudgeted limiter). Read-only accessor for host-side metric bridging
+    /// (wamn 9.8): a host observable instrument reads a store's limiter state
+    /// through these rather than re-parsing the `wamn::memory` denial logs.
+    pub fn component_id(&self) -> &str {
+        &self.component_id
+    }
+
+    /// The per-linear-memory budget in bytes, or `None` for an unbudgeted
+    /// (tracking-only) limiter.
+    pub fn budget_bytes(&self) -> Option<usize> {
+        self.budget_bytes
+    }
+
+    /// The largest linear-memory size this store reached (bytes) — the
+    /// high-water the limiter allowed, whether or not a budget is set.
+    pub fn high_water_bytes(&self) -> usize {
+        self.high_water
+    }
+
+    /// Grow attempts denied for exceeding the budget (monotonic; the same count
+    /// surfaced in the `wamn::memory` denial log).
+    pub fn denied_total(&self) -> u64 {
+        self.denied
+    }
 }
 
 impl wasmtime::ResourceLimiter for WamnStoreLimiter {
