@@ -321,6 +321,12 @@ pub(crate) async fn new_store_from_templates(
     }
 
     let mut store = wasmtime::Store::new(engine, shared_ctx);
+    let epoch_deadline_env = std::env::var("WAMN_EPOCH_DEADLINE_TICKS").ok();
+    apply_epoch_deadline(
+        &mut store,
+        &active.local_resources,
+        epoch_deadline_env.as_deref(),
+    );
 
     let active_id = active.component_id.clone();
     for (linked_id, linked_pre) in linked_instances {
@@ -339,6 +345,27 @@ pub(crate) async fn new_store_from_templates(
     }
 
     Ok(store)
+}
+
+/// Apply the wamn per-store epoch deadline policy.
+///
+/// Wasmtime stores start with a deadline of zero, so a host that enables epoch
+/// interruption and increments the engine epoch would otherwise trap every
+/// guest on the first tick. The active component's config wins over the host
+/// default; the fallback is effectively unbounded because `u64::MAX` would
+/// wrap when Wasmtime adds the delta to the current epoch.
+fn apply_epoch_deadline<T>(
+    store: &mut wasmtime::Store<T>,
+    local_resources: &crate::types::LocalResources,
+    host_default: Option<&str>,
+) {
+    let ticks = local_resources
+        .config
+        .get("wamn.epoch-deadline-ticks")
+        .and_then(|value| value.parse::<u64>().ok())
+        .or_else(|| host_default.and_then(|value| value.parse::<u64>().ok()))
+        .unwrap_or(u64::MAX / 2);
+    store.set_epoch_deadline(ticks);
 }
 
 /// The warm-instance pool of the component this call targets, or `None` when
@@ -901,4 +928,93 @@ pub(crate) async fn invoke_linked_sync_export(
         Ok(())
     }
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn epoch_deadline_policy_resolves_config_env_and_safe_default() {
+        let mut config = wasmtime::Config::new();
+        config.epoch_interruption(true);
+        let engine = wasmtime::Engine::new(&config).expect("epoch-enabled engine should build");
+        let wasm =
+            wat::parse_str("(module (func (export \"run\")))").expect("test module should parse");
+        let module = wasmtime::Module::new(&engine, wasm).expect("test module should compile");
+        let mut resources = crate::types::LocalResources::default();
+        resources
+            .config
+            .insert("wamn.epoch-deadline-ticks".to_string(), "3".to_string());
+
+        let mut config_store = wasmtime::Store::new(&engine, ());
+        apply_epoch_deadline(&mut config_store, &resources, Some("2"));
+        let config_instance = wasmtime::Instance::new(&mut config_store, &module, &[])
+            .expect("config store should instantiate");
+        let config_run = config_instance
+            .get_typed_func::<(), ()>(&mut config_store, "run")
+            .expect("run export should exist");
+
+        resources.config.clear();
+        let mut env_store = wasmtime::Store::new(&engine, ());
+        apply_epoch_deadline(&mut env_store, &resources, Some("2"));
+        let env_instance = wasmtime::Instance::new(&mut env_store, &module, &[])
+            .expect("environment store should instantiate");
+        let env_run = env_instance
+            .get_typed_func::<(), ()>(&mut env_store, "run")
+            .expect("run export should exist");
+
+        let mut fallback_store = wasmtime::Store::new(&engine, ());
+        apply_epoch_deadline(&mut fallback_store, &resources, None);
+        let fallback_instance = wasmtime::Instance::new(&mut fallback_store, &module, &[])
+            .expect("fallback store should instantiate");
+        let fallback_run = fallback_instance
+            .get_typed_func::<(), ()>(&mut fallback_store, "run")
+            .expect("run export should exist");
+
+        engine.increment_epoch();
+        engine.increment_epoch();
+        config_run
+            .call(&mut config_store, ())
+            .expect("component config must override the two-tick host default");
+        assert!(
+            env_run.call(&mut env_store, ()).is_err(),
+            "host default must expire after two ticks"
+        );
+        fallback_run
+            .call(&mut fallback_store, ())
+            .expect("effectively-unbounded fallback must survive two ticks");
+
+        engine.increment_epoch();
+        assert!(
+            config_run.call(&mut config_store, ()).is_err(),
+            "component-configured deadline must expire after three ticks"
+        );
+        fallback_run
+            .call(&mut fallback_store, ())
+            .expect("effectively-unbounded fallback must survive three ticks");
+    }
+
+    #[test]
+    fn epoch_deadline_policy_arms_store_before_first_tick() {
+        let mut config = wasmtime::Config::new();
+        config.epoch_interruption(true);
+        let engine = wasmtime::Engine::new(&config).expect("epoch-enabled engine should build");
+        let wasm =
+            wat::parse_str("(module (func (export \"run\")))").expect("test module should parse");
+        let module = wasmtime::Module::new(&engine, wasm).expect("test module should compile");
+        let resources = crate::types::LocalResources::default();
+        let mut store = wasmtime::Store::new(&engine, ());
+
+        apply_epoch_deadline(&mut store, &resources, None);
+        let instance = wasmtime::Instance::new(&mut store, &module, &[])
+            .expect("test module should instantiate");
+        let run = instance
+            .get_typed_func::<(), ()>(&mut store, "run")
+            .expect("run export should exist");
+
+        engine.increment_epoch();
+        run.call(&mut store, ())
+            .expect("effectively-unbounded fallback must survive the first tick");
+    }
 }
