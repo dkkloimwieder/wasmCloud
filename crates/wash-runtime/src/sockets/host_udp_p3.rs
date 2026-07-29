@@ -40,6 +40,23 @@ fn get_socket_mut<'a>(
         .map_err(SocketError::trap)
 }
 
+async fn check_unconnected_send_addresses(
+    check: &crate::sockets::SocketAddrCheck,
+    remote_address: SocketAddr,
+    implicit_bind_address: impl FnOnce() -> SocketResult<Option<SocketAddr>>,
+) -> SocketResult<Option<SocketAddr>> {
+    if !check(remote_address, SocketAddrUse::UdpOutgoingDatagram).await {
+        return Err(ErrorCode::AccessDenied.into());
+    }
+    let implicit_bind_address = implicit_bind_address()?;
+    if let Some(implicit_bind_address) = implicit_bind_address
+        && !check(implicit_bind_address, SocketAddrUse::UdpBind).await
+    {
+        return Err(ErrorCode::AccessDenied.into());
+    }
+    Ok(implicit_bind_address)
+}
+
 impl<T> HostUdpSocketWithStore<T> for WasiSockets {
     async fn send(
         store: &Accessor<T, Self>,
@@ -54,25 +71,24 @@ impl<T> HostUdpSocketWithStore<T> for WasiSockets {
 
         if let Some(addr) = remote_address {
             let check = store.with(|mut view| view.get().ctx.socket_addr_check.clone());
-            if !check(addr, SocketAddrUse::UdpOutgoingDatagram).await {
-                return Err(ErrorCode::AccessDenied.into());
-            }
 
             // An unbound socket implicitly binds to an ephemeral local port on
             // its first `send-to`. Mirror wasmtime's p3 UDP send: check that
             // implicit bind against the network policy (as an explicit `bind`
             // is checked) and then perform it, leaving the socket bound so this
             // runs once rather than on every datagram. (bytecodealliance/wasmtime#13677)
-            let implicit_family = store.with(|mut store| {
-                let view = store.get();
-                let sock = get_socket_mut(view.table, &socket)?;
-                SocketResult::Ok(sock.needs_implicit_bind().then(|| sock.address_family()))
-            })?;
-            if let Some(family) = implicit_family {
-                let implicit_addr = crate::sockets::util::implicit_bind_addr(family);
-                if !check(implicit_addr, SocketAddrUse::UdpBind).await {
-                    return Err(ErrorCode::AccessDenied.into());
-                }
+            let implicit_addr =
+                check_unconnected_send_addresses(&check, addr, || {
+                    store.with(|mut store| {
+                        let view = store.get();
+                        let sock = get_socket_mut(view.table, &socket)?;
+                        SocketResult::Ok(sock.needs_implicit_bind().then(|| {
+                            crate::sockets::util::implicit_bind_addr(sock.address_family())
+                        }))
+                    })
+                })
+                .await?;
+            if let Some(implicit_addr) = implicit_addr {
                 store.with(|mut store| {
                     let view = store.get();
                     let mut loopback = view
@@ -415,5 +431,90 @@ impl HostUdpSocket for WasiSocketsCtxView<'_> {
             .lock()
             .map_err(|e| wasmtime::format_err!("{e}"))?;
         socket.drop(&mut loopback)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sockets::SocketAddrCheck;
+    use std::sync::Mutex;
+
+    fn recording_check(
+        allow_datagram: bool,
+        allow_bind: bool,
+        seen: Arc<Mutex<Vec<&'static str>>>,
+    ) -> SocketAddrCheck {
+        SocketAddrCheck::new(move |_, reason| {
+            let seen = Arc::clone(&seen);
+            Box::pin(async move {
+                let (name, permitted) = match reason {
+                    SocketAddrUse::UdpOutgoingDatagram => ("outgoing-datagram", allow_datagram),
+                    SocketAddrUse::UdpBind => ("implicit-bind", allow_bind),
+                    _ => ("unexpected", false),
+                };
+                seen.lock()
+                    .expect("recording mutex should not be poisoned")
+                    .push(name);
+                permitted
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn p3_unconnected_send_checks_datagram_then_implicit_bind() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let check = recording_check(true, true, Arc::clone(&seen));
+
+        let result = check_unconnected_send_addresses(
+            &check,
+            SocketAddr::from(([192, 0, 2, 1], 53)),
+            || Ok(Some(SocketAddr::from(([0, 0, 0, 0], 0)))),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            *seen.lock().expect("recording mutex should not be poisoned"),
+            ["outgoing-datagram", "implicit-bind"]
+        );
+    }
+
+    #[tokio::test]
+    async fn p3_unconnected_send_stops_when_datagram_is_denied() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let check = recording_check(false, true, Arc::clone(&seen));
+
+        let result = check_unconnected_send_addresses(
+            &check,
+            SocketAddr::from(([192, 0, 2, 1], 53)),
+            || Ok(Some(SocketAddr::from(([0, 0, 0, 0], 0)))),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            *seen.lock().expect("recording mutex should not be poisoned"),
+            ["outgoing-datagram"]
+        );
+    }
+
+    #[tokio::test]
+    async fn p3_unconnected_send_denies_a_disallowed_implicit_bind() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let check = recording_check(true, false, Arc::clone(&seen));
+
+        let result = check_unconnected_send_addresses(
+            &check,
+            SocketAddr::from(([192, 0, 2, 1], 53)),
+            || Ok(Some(SocketAddr::from(([0, 0, 0, 0], 0)))),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            *seen.lock().expect("recording mutex should not be poisoned"),
+            ["outgoing-datagram", "implicit-bind"]
+        );
     }
 }
