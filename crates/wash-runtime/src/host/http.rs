@@ -446,7 +446,7 @@ impl OutgoingHandler for DefaultOutgoingHandler {
     fn send_request(
         &self,
         _workload_id: &str,
-        request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+        mut request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
         config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
     ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
     {
@@ -454,6 +454,10 @@ impl OutgoingHandler for DefaultOutgoingHandler {
         // `default_send_request`) so the request can be wrapped in a client
         // span and the response status recorded once it arrives.
         let span = outbound_client_span(request.method(), request.uri());
+        {
+            use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+            inject_outbound_trace_context_p2(&span.context(), &mut request);
+        }
         let handle = wasmtime_wasi::runtime::spawn(
             async move {
                 let result =
@@ -1126,7 +1130,7 @@ impl<T: Router, O: OutgoingHandler> HostHandler for HttpServer<T, O> {
     fn outgoing_request(
         &self,
         workload_id: &str,
-        request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+        mut request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
         config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
         allowed_hosts: &[AllowedHost],
     ) -> wasmtime_wasi_http::p2::HttpResult<wasmtime_wasi_http::p2::types::HostFutureIncomingResponse>
@@ -1139,6 +1143,10 @@ impl<T: Router, O: OutgoingHandler> HostHandler for HttpServer<T, O> {
             return Err(wasmtime_wasi_http::p2::HttpError::trap(
                 wasmtime_wasi_http::p2::bindings::http::types::ErrorCode::HttpRequestDenied,
             ));
+        }
+        {
+            use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+            inject_outbound_trace_context_p2(&tracing::Span::current().context(), &mut request);
         }
         if is_grpc_request(&request) {
             return Ok(send_grpc_request(request, config));
@@ -1156,6 +1164,11 @@ impl<T: Router, O: OutgoingHandler> HostHandler for HttpServer<T, O> {
         allowed_hosts: &[AllowedHost],
     ) -> crate::host::http_p3::P3SendFuture {
         let span = outbound_client_span(request.method(), request.uri());
+        let mut request = request;
+        {
+            use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+            inject_outbound_trace_context_p3(&span.context(), &mut request);
+        }
         let inner: crate::host::http_p3::P3SendFuture = if let Err(e) = self
             .router
             .allow_outgoing_request_p3(workload_id, &request, options, allowed_hosts)
@@ -1476,6 +1489,35 @@ fn outbound_client_span(method: &hyper::Method, uri: &hyper::Uri) -> tracing::Sp
         span.record(SERVER_PORT, port);
     }
     span
+}
+
+/// Inject the supplied OpenTelemetry context into a P2 outgoing request.
+///
+/// The host calls this before its HTTP/gRPC/custom-transport branch. Built-in
+/// P2 transports call it again after creating their client span so the
+/// downstream server is parented to that span rather than its caller.
+fn inject_outbound_trace_context_p2(
+    context: &opentelemetry::Context,
+    request: &mut hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+) {
+    inject_outbound_trace_context(context, request.headers_mut());
+}
+
+/// Inject the supplied OpenTelemetry context into a P3 outgoing request.
+///
+/// P3 creates its client span before the HTTP/gRPC/custom-transport branch, so
+/// one injection at that common seam covers every P3 transport.
+fn inject_outbound_trace_context_p3(
+    context: &opentelemetry::Context,
+    request: &mut hyper::Request<crate::host::http_p3::P3Body>,
+) {
+    inject_outbound_trace_context(context, request.headers_mut());
+}
+
+fn inject_outbound_trace_context(context: &opentelemetry::Context, headers: &mut hyper::HeaderMap) {
+    opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(context, &mut opentelemetry_http::HeaderInjector(headers));
+    });
 }
 
 /// Record an outbound response status on the current span. Per the HTTP client
@@ -1868,10 +1910,14 @@ fn is_grpc_request<B>(req: &hyper::Request<B>) -> bool {
 
 /// Send a gRPC request over HTTP/2.
 fn send_grpc_request(
-    request: hyper::Request<HyperOutgoingBody>,
+    mut request: hyper::Request<HyperOutgoingBody>,
     config: OutgoingRequestConfig,
 ) -> HostFutureIncomingResponse {
     let span = outbound_client_span(request.method(), request.uri());
+    {
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        inject_outbound_trace_context_p2(&span.context(), &mut request);
+    }
     let handle = wasmtime_wasi::runtime::spawn(
         async move {
             let result = send_grpc_request_handler(request, config).await;
@@ -2211,6 +2257,9 @@ async fn send_grpc_request_p3_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry::trace::{
+        SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
+    };
     use wasmtime_wasi_http::p2::body::HyperOutgoingBody;
     use wasmtime_wasi_http::p2::types::OutgoingRequestConfig;
 
@@ -2219,6 +2268,57 @@ mod tests {
             .uri(uri)
             .body(HyperOutgoingBody::default())
             .unwrap()
+    }
+
+    fn sampled_remote_context() -> opentelemetry::Context {
+        opentelemetry::Context::new().with_remote_span_context(SpanContext::new(
+            TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap(),
+            SpanId::from_hex("00f067aa0ba902b7").unwrap(),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::default(),
+        ))
+    }
+
+    fn install_trace_context_propagator() {
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+    }
+
+    #[test]
+    fn outbound_trace_context_is_injected_for_p2() {
+        install_trace_context_propagator();
+        let mut request = build_request("http://example.com/");
+
+        inject_outbound_trace_context_p2(&sampled_remote_context(), &mut request);
+
+        assert_eq!(
+            request.headers().get("traceparent").unwrap(),
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        );
+    }
+
+    #[test]
+    fn outbound_trace_context_is_injected_for_p3() {
+        use crate::host::http_p3::P3Body;
+        use http_body_util::BodyExt;
+
+        install_trace_context_propagator();
+        let body: P3Body = http_body_util::Empty::new()
+            .map_err(|never| match never {})
+            .boxed_unsync();
+        let mut request = hyper::Request::builder()
+            .uri("http://example.com/")
+            .body(body)
+            .unwrap();
+
+        inject_outbound_trace_context_p3(&sampled_remote_context(), &mut request);
+
+        assert_eq!(
+            request.headers().get("traceparent").unwrap(),
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        );
     }
 
     /// Guards the P3 streaming regression fix: `run_http_server` must disable
