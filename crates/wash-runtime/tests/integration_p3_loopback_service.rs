@@ -30,6 +30,11 @@ const SVC_TCP_ECHO_WASM: &[u8] = include_bytes!("wasm/svc_tcp_echo.wasm");
 const HTTP_LOOPBACK_GATEWAY_WASM: &[u8] = include_bytes!("wasm/http_loopback_gateway.wasm");
 
 fn echo_workload(host: &str) -> WorkloadStartRequest {
+    let mut gateway_resources = LocalResources::default();
+    gateway_resources
+        .config
+        .insert("wamn.allow-raw-sockets".to_string(), "true".to_string());
+
     WorkloadStartRequest {
         workload_id: uuid::Uuid::new_v4().to_string(),
         workload: Workload {
@@ -46,7 +51,7 @@ fn echo_workload(host: &str) -> WorkloadStartRequest {
                 name: "http-loopback-gateway".to_string(),
                 digest: None,
                 bytes: bytes::Bytes::from_static(HTTP_LOOPBACK_GATEWAY_WASM),
-                local_resources: LocalResources::default(),
+                local_resources: gateway_resources,
                 pool_size: 1,
                 max_invocations: 1000,
             }],
