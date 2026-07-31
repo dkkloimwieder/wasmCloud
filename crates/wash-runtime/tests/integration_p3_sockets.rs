@@ -12,12 +12,16 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
+use tokio::time::{sleep, timeout};
 
 use wash_runtime::{
     engine::Engine,
     host::{HostApi, HostBuilder},
-    types::{Component, Service, Workload, WorkloadStartRequest},
+    types::{
+        Component, LocalResources, Service, Workload, WorkloadStartRequest, WorkloadState,
+        WorkloadStatusRequest,
+    },
 };
 
 const SOCKET_TEST_P3_WASM: &[u8] = include_bytes!("wasm/socket_test_p3.wasm");
@@ -40,8 +44,13 @@ async fn test_p3_tcp_loopback() -> Result<()> {
     let host = HostBuilder::new().with_engine(engine).build()?;
     let host = host.start().await?;
 
+    let workload_id = uuid::Uuid::new_v4().to_string();
+    let mut local_resources = LocalResources::default();
+    local_resources
+        .config
+        .insert("wamn.allow-raw-sockets".to_string(), "true".to_string());
     let req = WorkloadStartRequest {
-        workload_id: uuid::Uuid::new_v4().to_string(),
+        workload_id: workload_id.clone(),
         workload: Workload {
             namespace: "test".to_string(),
             name: "p3-socket-tcp".to_string(),
@@ -49,7 +58,7 @@ async fn test_p3_tcp_loopback() -> Result<()> {
             service: Some(Service {
                 digest: None,
                 bytes: bytes::Bytes::from_static(SOCKET_TEST_P3_WASM),
-                local_resources: Default::default(),
+                local_resources,
                 max_restarts: 0,
             }),
             components: vec![],
@@ -62,9 +71,32 @@ async fn test_p3_tcp_loopback() -> Result<()> {
         .await
         .context("P3 socket test service should start and complete")?;
 
-    // The service runs both TCP and UDP tests, then exits.
-    // Give it time to complete.
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    // The service runs both TCP and UDP tests, then exits. Observe its
+    // terminal cli/run result so a guest error or trap cannot be a false green.
+    let status = timeout(Duration::from_secs(10), async {
+        loop {
+            let response = host
+                .workload_status(WorkloadStatusRequest {
+                    workload_id: workload_id.clone(),
+                })
+                .await?;
+            match response.workload_status.workload_state {
+                WorkloadState::Starting | WorkloadState::Running => {
+                    sleep(Duration::from_millis(10)).await;
+                }
+                _ => return Ok::<_, anyhow::Error>(response.workload_status),
+            }
+        }
+    })
+    .await
+    .context("P3 socket test service did not report a terminal outcome")??;
+
+    assert_eq!(
+        status.workload_state,
+        WorkloadState::Completed,
+        "P3 socket test service failed: {}",
+        status.message
+    );
 
     Ok(())
 }

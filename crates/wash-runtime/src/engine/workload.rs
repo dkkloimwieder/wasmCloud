@@ -4,7 +4,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ops::{Deref, DerefMut},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use crate::{plugin::WitInterfaces, sockets::loopback};
@@ -251,6 +251,15 @@ impl WorkloadMetadata {
     }
 }
 
+/// The terminal outcome of a P3 service after its restart budget is exhausted.
+#[derive(Debug)]
+pub(crate) enum ServiceCompletion {
+    /// The service's `wasi:cli/run` export returned successfully.
+    Completed,
+    /// The service returned an error or trapped.
+    Error(String),
+}
+
 /// A [`WorkloadService`] is a component that is part of a workload that
 /// runs once, either to completion or for the duration of the workload lifecycle.
 #[derive(Clone)]
@@ -261,6 +270,8 @@ pub struct WorkloadService {
     max_restarts: u64,
     /// The [`JoinHandle`] for the running service
     handle: Option<Arc<JoinHandle<()>>>,
+    /// Terminal P3 execution outcome, shared with the host status projection.
+    completion: Arc<OnceLock<ServiceCompletion>>,
 }
 
 impl WorkloadService {
@@ -294,6 +305,7 @@ impl WorkloadService {
                 linked_components: Default::default(),
             },
             handle: None,
+            completion: Arc::new(OnceLock::new()),
             max_restarts,
         }
     }
@@ -331,6 +343,11 @@ impl WorkloadService {
     /// Whether or not the service is currently running.
     pub fn is_running(&self) -> bool {
         self.handle.is_some()
+    }
+
+    /// Return the terminal P3 execution outcome, when the service has finished.
+    pub(crate) fn completion(&self) -> Option<&ServiceCompletion> {
+        self.completion.get()
     }
 }
 
@@ -688,20 +705,25 @@ impl ResolvedWorkload {
             // instance, so reuse after a fault would leave every restart
             // permanently broken (and even a clean restart would accumulate
             // stale instances in a reused store).
-            let recipe = {
+            let (recipe, completion) = {
                 let Some(service) = self.service.as_ref() else {
                     bail!("service unexpectedly missing during execution");
                 };
-                self.service_store_recipe(&service.metadata).await?
+                (
+                    self.service_store_recipe(&service.metadata).await?,
+                    Arc::clone(&service.completion),
+                )
             };
             let mut store = recipe.build().await?;
             let handle = tokio::spawn(async move {
-                loop {
+                let outcome = loop {
                     let instance = match pre.instantiate_async(&mut store).await {
                         Ok(i) => i,
                         Err(e) => {
                             error!(err = %e, "failed to instantiate P3 service");
-                            break;
+                            break ServiceCompletion::Error(format!(
+                                "failed to instantiate P3 service: {e}"
+                            ));
                         }
                     };
                     let result = store
@@ -712,20 +734,24 @@ impl ResolvedWorkload {
                     match result {
                         Ok(Ok(Ok(()))) => {
                             info!("P3 service exited successfully");
-                            break;
+                            break ServiceCompletion::Completed;
                         }
                         Ok(Ok(Err(()))) => {
                             error!(retries = max_restarts, "P3 service exited with error");
                             if max_restarts == 0 {
                                 warn!("max restarts reached, P3 service will not be restarted");
-                                break;
+                                break ServiceCompletion::Error(
+                                    "P3 service exited with error".to_string(),
+                                );
                             }
                         }
                         Ok(Err(e)) | Err(e) => {
                             error!(err = %e, retries = max_restarts, "P3 service execution failed");
                             if max_restarts == 0 {
                                 warn!("max restarts reached, P3 service will not be restarted");
-                                break;
+                                break ServiceCompletion::Error(format!(
+                                    "P3 service execution failed: {e}"
+                                ));
                             }
                         }
                     }
@@ -734,10 +760,13 @@ impl ResolvedWorkload {
                         Ok(fresh) => store = fresh,
                         Err(e) => {
                             error!(err = %e, "failed to rebuild P3 service store; giving up");
-                            break;
+                            break ServiceCompletion::Error(format!(
+                                "failed to rebuild P3 service store: {e}"
+                            ));
                         }
                     }
-                }
+                };
+                let _ = completion.set(outcome);
             });
 
             let handle = Arc::new(handle);
@@ -885,6 +914,11 @@ impl ResolvedWorkload {
                 "service for workload aborted"
             );
         }
+    }
+
+    /// Return the terminal P3 service outcome, when the workload has one.
+    pub(crate) fn service_completion(&self) -> Option<&ServiceCompletion> {
+        self.service.as_ref().and_then(WorkloadService::completion)
     }
 
     pub fn components(&self) -> Arc<RwLock<BTreeMap<Arc<str>, WorkloadComponent>>> {

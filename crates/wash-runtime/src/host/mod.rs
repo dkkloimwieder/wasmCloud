@@ -52,7 +52,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, trace, warn};
 use wasmtime::component::Component;
 
-use crate::engine::workload::ResolvedWorkload;
+use crate::engine::workload::{ResolvedWorkload, ServiceCompletion};
 use crate::engine::{Engine, uses_wasi_http};
 use crate::observability::Meters;
 use crate::plugin::{HostPlugin, WorkloadFailure, WorkloadFailureSink};
@@ -767,11 +767,24 @@ impl HostApi for Host {
         request: WorkloadStatusRequest,
     ) -> anyhow::Result<WorkloadStatusResponse> {
         if let Some(workload) = self.workloads.read().await.get(&request.workload_id) {
-            let workload_state = workload.into();
+            let (workload_state, message) = match workload {
+                HostWorkload::Running(workload) => match workload.service_completion() {
+                    Some(ServiceCompletion::Completed) => (
+                        WorkloadState::Completed,
+                        "Workload service completed successfully".to_string(),
+                    ),
+                    Some(ServiceCompletion::Error(error)) => (
+                        WorkloadState::Error,
+                        format!("Workload service failed: {error}"),
+                    ),
+                    None => (WorkloadState::Running, "Workload is Running".to_string()),
+                },
+                _ => (workload.into(), format!("Workload is {workload}")),
+            };
             Ok(WorkloadStatusResponse {
                 workload_status: WorkloadStatus {
                     workload_id: request.workload_id,
-                    message: format!("Workload is {workload}"),
+                    message,
                     workload_state,
                 },
             })
