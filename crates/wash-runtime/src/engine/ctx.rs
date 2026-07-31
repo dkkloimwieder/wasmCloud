@@ -96,6 +96,26 @@ impl WamnStoreLimiter {
             high_water: 0,
         }
     }
+
+    /// The component this limiter's budget belongs to.
+    pub fn component_id(&self) -> &str {
+        &self.component_id
+    }
+
+    /// The per-linear-memory budget in bytes, or `None` when unbudgeted.
+    pub fn budget_bytes(&self) -> Option<usize> {
+        self.budget_bytes
+    }
+
+    /// The largest allowed linear-memory size reached by this store.
+    pub fn high_water_bytes(&self) -> usize {
+        self.high_water
+    }
+
+    /// The number of memory or table growth attempts this limiter denied.
+    pub fn denied_total(&self) -> u64 {
+        self.denied
+    }
 }
 
 impl wasmtime::ResourceLimiter for WamnStoreLimiter {
@@ -724,6 +744,26 @@ mod tests {
                 .expect("denied table decision should succeed")
         );
         assert_eq!(limiter.denied, 2);
+    }
+
+    #[test]
+    fn wamn_store_limiter_accessors_report_current_state() {
+        let mut limiter = WamnStoreLimiter::new(64 << 20, Arc::from("component-a"));
+        assert!(
+            limiter
+                .memory_growing(0, 32 << 20, None)
+                .expect("allowed memory decision should succeed")
+        );
+        assert!(
+            !limiter
+                .memory_growing(32 << 20, 65 << 20, None)
+                .expect("denied memory decision should succeed")
+        );
+
+        assert_eq!(limiter.component_id(), "component-a");
+        assert_eq!(limiter.budget_bytes(), Some(64 << 20));
+        assert_eq!(limiter.high_water_bytes(), 32 << 20);
+        assert_eq!(limiter.denied_total(), 1);
     }
 
     #[test]
