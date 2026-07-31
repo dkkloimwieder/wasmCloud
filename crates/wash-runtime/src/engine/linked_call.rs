@@ -19,6 +19,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::RwLock;
 use tokio::time::timeout;
@@ -217,6 +218,30 @@ pub(crate) fn func_is_bridge_safe(func_ty: &ComponentFunc) -> bool {
         && func_ty.results().all(|ty| type_is_bridge_safe(&ty))
 }
 
+/// Resolve the raw-sockets opt-in with config taking precedence over the environment.
+fn resolve_allow_raw_sockets(config: Option<&str>, env: Option<&str>) -> bool {
+    config
+        .map(|value| value.parse::<bool>().unwrap_or(false))
+        .or_else(|| env.map(|value| value.parse::<bool>().unwrap_or(false)))
+        .unwrap_or(false)
+}
+
+/// Decide whether the component may use `addr` for the requested socket operation.
+fn socket_addr_permitted(
+    reason: SocketAddrUse,
+    ip_is_loopback: bool,
+    ip_is_unspecified: bool,
+    is_service: bool,
+    allow_raw_sockets: bool,
+) -> bool {
+    match reason {
+        SocketAddrUse::TcpBind => is_service && ip_is_loopback,
+        SocketAddrUse::TcpConnect => allow_raw_sockets,
+        SocketAddrUse::UdpBind => ip_is_loopback || ip_is_unspecified,
+        SocketAddrUse::UdpConnect | SocketAddrUse::UdpOutgoingDatagram => true,
+    }
+}
+
 async fn build_ctx_from_template(
     template: &ComponentCtxTemplate,
     http_handler: Arc<dyn crate::host::http::HostHandler>,
@@ -238,17 +263,47 @@ async fn build_ctx_from_template(
         .inherit_stdout()
         .inherit_stderr();
 
+    // `wasi:sockets` is linked unconditionally. `allowed_ip_name_lookups`
+    // governs only name resolution, while the HTTP egress allowlist governs
+    // only `wasi:http`; neither policy grants raw TCP access.
+    let allow_raw_sockets = resolve_allow_raw_sockets(
+        template
+            .local_resources
+            .config
+            .get("wamn.allow-raw-sockets")
+            .map(String::as_str),
+        std::env::var("WAMN_ALLOW_RAW_SOCKETS").ok().as_deref(),
+    );
+    let raw_socket_component = Arc::clone(&template.component_id);
+    let raw_socket_denial_logged = Arc::new(AtomicBool::new(false));
+
     let sockets_ctx = sockets::WasiSocketsCtx {
         socket_addr_check: sockets::SocketAddrCheck::new(move |addr, reason| {
+            let raw_socket_component = Arc::clone(&raw_socket_component);
+            let raw_socket_denial_logged = Arc::clone(&raw_socket_denial_logged);
             Box::pin(async move {
-                match reason {
-                    SocketAddrUse::TcpBind if is_service => addr.ip().is_loopback(),
-                    SocketAddrUse::TcpBind => false,
-                    SocketAddrUse::UdpBind => addr.ip().is_loopback() || addr.ip().is_unspecified(),
-                    SocketAddrUse::TcpConnect
-                    | SocketAddrUse::UdpConnect
-                    | SocketAddrUse::UdpOutgoingDatagram => true,
+                let permitted = socket_addr_permitted(
+                    reason,
+                    addr.ip().is_loopback(),
+                    addr.ip().is_unspecified(),
+                    is_service,
+                    allow_raw_sockets,
+                );
+                if !permitted
+                    && matches!(reason, SocketAddrUse::TcpConnect)
+                    && !raw_socket_denial_logged.swap(true, Ordering::Relaxed)
+                {
+                    tracing::warn!(
+                        target: "wamn::sockets",
+                        component = %raw_socket_component,
+                        addr = %addr,
+                        "wasi:sockets TcpConnect denied: workload has not opted into raw \
+                         sockets (set wamn.allow-raw-sockets=true or \
+                         WAMN_ALLOW_RAW_SOCKETS=true); lookup and HTTP egress allowlists do not \
+                         grant raw TCP"
+                    );
                 }
+                permitted
             })
         }),
         loopback: Arc::clone(&template.loopback),
@@ -1169,5 +1224,60 @@ mod tests {
         engine.increment_epoch();
         run.call(&mut store, ())
             .expect("effectively-unbounded fallback must survive the first tick");
+    }
+
+    #[test]
+    fn raw_sockets_default_denies() {
+        assert!(!resolve_allow_raw_sockets(None, None));
+    }
+
+    #[test]
+    fn raw_sockets_unparseable_config_denies_without_env_fallback() {
+        assert!(!resolve_allow_raw_sockets(Some("invalid"), Some("true")));
+    }
+
+    #[test]
+    fn raw_sockets_unparseable_env_denies() {
+        assert!(!resolve_allow_raw_sockets(None, Some("invalid")));
+    }
+
+    #[test]
+    fn raw_sockets_config_precedes_env() {
+        assert!(!resolve_allow_raw_sockets(Some("false"), Some("true")));
+        assert!(resolve_allow_raw_sockets(Some("true"), Some("false")));
+    }
+
+    #[test]
+    fn raw_sockets_env_allows_when_config_is_absent() {
+        assert!(resolve_allow_raw_sockets(None, Some("true")));
+    }
+
+    #[test]
+    fn tcp_connect_denied_without_raw_socket_opt_in() {
+        assert!(!socket_addr_permitted(
+            SocketAddrUse::TcpConnect,
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert!(!socket_addr_permitted(
+            SocketAddrUse::TcpConnect,
+            true,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn tcp_connect_allowed_with_raw_socket_opt_in() {
+        assert!(socket_addr_permitted(
+            SocketAddrUse::TcpConnect,
+            false,
+            false,
+            false,
+            true,
+        ));
     }
 }

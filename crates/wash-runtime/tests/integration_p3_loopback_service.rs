@@ -29,7 +29,7 @@ use common::{http_only_host_interfaces, start_host_with_p3_http_handler};
 const SVC_TCP_ECHO_WASM: &[u8] = include_bytes!("wasm/svc_tcp_echo.wasm");
 const HTTP_LOOPBACK_GATEWAY_WASM: &[u8] = include_bytes!("wasm/http_loopback_gateway.wasm");
 
-fn echo_workload(host: &str) -> WorkloadStartRequest {
+fn echo_workload(host: &str, gateway_resources: LocalResources) -> WorkloadStartRequest {
     WorkloadStartRequest {
         workload_id: uuid::Uuid::new_v4().to_string(),
         workload: Workload {
@@ -46,7 +46,7 @@ fn echo_workload(host: &str) -> WorkloadStartRequest {
                 name: "http-loopback-gateway".to_string(),
                 digest: None,
                 bytes: bytes::Bytes::from_static(HTTP_LOOPBACK_GATEWAY_WASM),
-                local_resources: LocalResources::default(),
+                local_resources: gateway_resources,
                 pool_size: 1,
                 max_invocations: 1000,
             }],
@@ -64,7 +64,11 @@ fn echo_workload(host: &str) -> WorkloadStartRequest {
 async fn test_tickless_loopback_service_answers_promptly() -> Result<()> {
     let host_name = "loopback-echo";
     let (addr, host) = start_host_with_p3_http_handler("127.0.0.1:0").await?;
-    host.workload_start(echo_workload(host_name))
+    let mut gateway_resources = LocalResources::default();
+    gateway_resources
+        .config
+        .insert("wamn.allow-raw-sockets".to_string(), "true".to_string());
+    host.workload_start(echo_workload(host_name, gateway_resources))
         .await
         .context("failed to start loopback echo workload")?;
 
@@ -105,6 +109,43 @@ async fn test_tickless_loopback_service_answers_promptly() -> Result<()> {
             "request {i} took {elapsed:?}; loopback round-trips should be fast"
         );
     }
+
+    Ok(())
+}
+
+/// Allowing every IP-name lookup must not grant the separate raw-TCP capability.
+#[tokio::test]
+async fn test_allowed_ip_name_lookups_cannot_bypass_raw_tcp_denial() -> Result<()> {
+    let host_name = "loopback-lookup-only";
+    let (addr, host) = start_host_with_p3_http_handler("127.0.0.1:0").await?;
+    let mut gateway_resources = LocalResources {
+        allowed_ip_name_lookups: vec!["*".parse().expect("allow-all lookup policy should parse")]
+            .into(),
+        ..Default::default()
+    };
+    gateway_resources
+        .config
+        .insert("wamn.allow-raw-sockets".to_string(), "false".to_string());
+    host.workload_start(echo_workload(host_name, gateway_resources))
+        .await
+        .context("failed to start lookup-only loopback workload")?;
+
+    let response = timeout(
+        Duration::from_secs(5),
+        reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .header("HOST", host_name)
+            .send(),
+    )
+    .await
+    .context("lookup-only request timed out instead of receiving TCP denial")?
+    .context("lookup-only request failed before the runtime returned TCP denial")?;
+
+    anyhow::ensure!(
+        response.status().is_server_error(),
+        "allow-all allowed_ip_name_lookups must not grant raw TCP; got {}",
+        response.status()
+    );
 
     Ok(())
 }
