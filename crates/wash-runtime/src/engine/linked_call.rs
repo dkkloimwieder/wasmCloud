@@ -33,7 +33,9 @@ use wasmtime_wasi::WasiCtxBuilder;
 
 #[cfg(feature = "wasi-tls")]
 use crate::engine::ctx::SharedTlsProvider;
-use crate::engine::ctx::{AccessorActiveCtxGuard, Ctx, SharedCtx, StoreActiveCtxGuard};
+use crate::engine::ctx::{
+    AccessorActiveCtxGuard, Ctx, SharedCtx, StoreActiveCtxGuard, WamnStoreLimiter,
+};
 use crate::engine::instance_pool::{self, ComponentInstance, InstancePool};
 use crate::engine::store::relocate::{self, Relocated, bridgeable_element_type};
 use crate::engine::store::stream_pump::Done;
@@ -327,6 +329,15 @@ pub(crate) async fn new_store_from_templates(
         &active.local_resources,
         epoch_deadline_env.as_deref(),
     );
+    let memory_budget_env = std::env::var("WAMN_MEMORY_LIMIT_MB").ok();
+    let memory_ceiling_env = std::env::var("WAMN_MEMORY_CEILING_MB").ok();
+    apply_memory_limiter(
+        &mut store,
+        &active.local_resources,
+        &active.component_id,
+        memory_budget_env.as_deref(),
+        memory_ceiling_env.as_deref(),
+    )?;
 
     let active_id = active.component_id.clone();
     for (linked_id, linked_pre) in linked_instances {
@@ -366,6 +377,65 @@ fn apply_epoch_deadline<T>(
         .or_else(|| host_default.and_then(|value| value.parse::<u64>().ok()))
         .unwrap_or(u64::MAX / 2);
     store.set_epoch_deadline(ticks);
+}
+
+/// Apply the wamn per-component memory-budget policy to a workload store.
+fn apply_memory_limiter(
+    store: &mut wasmtime::Store<SharedCtx>,
+    local_resources: &crate::types::LocalResources,
+    component_id: &Arc<str>,
+    host_default: Option<&str>,
+    host_ceiling: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(budget_bytes) =
+        resolve_memory_budget_bytes(local_resources, component_id, host_default, host_ceiling)?
+    else {
+        return Ok(());
+    };
+
+    store.data_mut().wamn_limiter = WamnStoreLimiter::new(budget_bytes, Arc::clone(component_id));
+    store.limiter(|ctx| &mut ctx.wamn_limiter);
+    Ok(())
+}
+
+fn resolve_memory_budget_bytes(
+    local_resources: &crate::types::LocalResources,
+    component_id: &Arc<str>,
+    host_default: Option<&str>,
+    host_ceiling: Option<&str>,
+) -> anyhow::Result<Option<usize>> {
+    let budget_mb = (local_resources.memory_limit_mb > 0)
+        .then_some(local_resources.memory_limit_mb as u64)
+        .or_else(|| {
+            local_resources
+                .config
+                .get("wamn.memory-limit-mb")
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .or_else(|| host_default.and_then(|value| value.parse::<u64>().ok()));
+    let Some(budget_mb) = budget_mb else {
+        return Ok(None);
+    };
+
+    if let Some(ceiling_mb) = host_ceiling.and_then(|value| value.parse::<u64>().ok()) {
+        if budget_mb > ceiling_mb {
+            anyhow::bail!(
+                "component '{component_id}': wamn memory budget {budget_mb} MiB exceeds the host \
+                 ceiling {ceiling_mb} MiB (pooling max_memory_size); lower the budget or raise \
+                 the ceiling"
+            );
+        }
+    }
+
+    let budget_bytes = usize::try_from(budget_mb)
+        .ok()
+        .and_then(|value| value.checked_mul(1 << 20))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "component '{component_id}': wamn memory budget {budget_mb} MiB is too large"
+            )
+        })?;
+    Ok(Some(budget_bytes))
 }
 
 /// The warm-instance pool of the component this call targets, or `None` when
@@ -933,6 +1003,89 @@ pub(crate) async fn invoke_linked_sync_export(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wasmtime::ResourceLimiter as _;
+
+    #[test]
+    fn memory_limiter_policy_resolves_spec_config_env_and_unbudgeted() {
+        let component_id: Arc<str> = Arc::from("component-a");
+        let mut resources = crate::types::LocalResources {
+            memory_limit_mb: 128,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_memory_budget_bytes(&resources, &component_id, Some("32"), Some("256"))
+                .expect("spec budget should resolve"),
+            Some(128 << 20)
+        );
+
+        resources.memory_limit_mb = -1;
+        resources
+            .config
+            .insert("wamn.memory-limit-mb".to_string(), "64".to_string());
+        assert_eq!(
+            resolve_memory_budget_bytes(&resources, &component_id, Some("32"), Some("256"))
+                .expect("config budget should resolve"),
+            Some(64 << 20)
+        );
+
+        resources.config.clear();
+        assert_eq!(
+            resolve_memory_budget_bytes(&resources, &component_id, Some("32"), Some("256"))
+                .expect("host default should resolve"),
+            Some(32 << 20)
+        );
+        assert_eq!(
+            resolve_memory_budget_bytes(&resources, &component_id, None, Some("256"))
+                .expect("unbudgeted policy should resolve"),
+            None
+        );
+    }
+
+    #[test]
+    fn memory_limiter_policy_rejects_budget_above_host_ceiling() {
+        let component_id: Arc<str> = Arc::from("component-a");
+        let resources = crate::types::LocalResources {
+            memory_limit_mb: 257,
+            ..Default::default()
+        };
+
+        let error = resolve_memory_budget_bytes(&resources, &component_id, None, Some("256"))
+            .expect_err("an over-ceiling budget must be refused, never clamped");
+
+        assert_eq!(
+            error.to_string(),
+            "component 'component-a': wamn memory budget 257 MiB exceeds the host ceiling 256 MiB \
+             (pooling max_memory_size); lower the budget or raise the ceiling"
+        );
+    }
+
+    #[test]
+    fn memory_limiter_policy_attaches_configured_budget() {
+        #[cfg(feature = "wasi-tls")]
+        crate::init_crypto();
+
+        let engine = wasmtime::Engine::default();
+        let ctx = Ctx::builder("workload-a", "component-a").build();
+        let mut store = wasmtime::Store::new(&engine, SharedCtx::new(ctx));
+        let component_id: Arc<str> = Arc::from("component-a");
+        let resources = crate::types::LocalResources {
+            memory_limit_mb: 64,
+            ..Default::default()
+        };
+
+        apply_memory_limiter(&mut store, &resources, &component_id, None, Some("256"))
+            .expect("configured limiter should attach");
+
+        assert!(
+            !store
+                .data_mut()
+                .wamn_limiter
+                .memory_growing(0, 65 << 20, None)
+                .expect("limiter decision should succeed"),
+            "configured budget must deny a larger grow"
+        );
+    }
 
     #[test]
     fn epoch_deadline_policy_resolves_config_env_and_safe_default() {
