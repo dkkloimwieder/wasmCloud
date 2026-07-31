@@ -230,16 +230,24 @@ fn resolve_allow_raw_sockets(config: Option<&str>, env: Option<&str>) -> bool {
 fn socket_addr_permitted(
     reason: SocketAddrUse,
     ip_is_loopback: bool,
-    ip_is_unspecified: bool,
+    _ip_is_unspecified: bool,
     is_service: bool,
     allow_raw_sockets: bool,
 ) -> bool {
     match reason {
-        SocketAddrUse::TcpBind => is_service && ip_is_loopback,
+        SocketAddrUse::TcpBind | SocketAddrUse::UdpBind => is_service && ip_is_loopback,
         SocketAddrUse::TcpConnect => allow_raw_sockets,
-        SocketAddrUse::UdpBind => ip_is_loopback || ip_is_unspecified,
-        SocketAddrUse::UdpConnect | SocketAddrUse::UdpOutgoingDatagram => true,
+        SocketAddrUse::UdpConnect => allow_raw_sockets,
+        SocketAddrUse::UdpOutgoingDatagram => allow_raw_sockets,
     }
+}
+
+/// Return whether a denied operation is raw egress and should emit the warn-once event.
+fn is_raw_egress(reason: SocketAddrUse) -> bool {
+    matches!(
+        reason,
+        SocketAddrUse::TcpConnect | SocketAddrUse::UdpConnect | SocketAddrUse::UdpOutgoingDatagram
+    )
 }
 
 async fn build_ctx_from_template(
@@ -265,7 +273,7 @@ async fn build_ctx_from_template(
 
     // `wasi:sockets` is linked unconditionally. `allowed_ip_name_lookups`
     // governs only name resolution, while the HTTP egress allowlist governs
-    // only `wasi:http`; neither policy grants raw TCP access.
+    // only `wasi:http`; neither policy grants raw TCP or UDP access.
     let allow_raw_sockets = resolve_allow_raw_sockets(
         template
             .local_resources
@@ -290,17 +298,18 @@ async fn build_ctx_from_template(
                     allow_raw_sockets,
                 );
                 if !permitted
-                    && matches!(reason, SocketAddrUse::TcpConnect)
+                    && is_raw_egress(reason)
                     && !raw_socket_denial_logged.swap(true, Ordering::Relaxed)
                 {
                     tracing::warn!(
                         target: "wamn::sockets",
                         component = %raw_socket_component,
                         addr = %addr,
-                        "wasi:sockets TcpConnect denied: workload has not opted into raw \
+                        reason = ?reason,
+                        "wasi:sockets raw egress denied: workload has not opted into raw \
                          sockets (set wamn.allow-raw-sockets=true or \
                          WAMN_ALLOW_RAW_SOCKETS=true); lookup and HTTP egress allowlists do not \
-                         grant raw TCP"
+                         grant raw TCP or UDP"
                     );
                 }
                 permitted
@@ -1279,5 +1288,168 @@ mod tests {
             false,
             true,
         ));
+    }
+
+    #[test]
+    fn udp_connect_denied_without_raw_socket_opt_in() {
+        assert!(!socket_addr_permitted(
+            SocketAddrUse::UdpConnect,
+            false,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn udp_connect_allowed_with_raw_socket_opt_in() {
+        assert!(socket_addr_permitted(
+            SocketAddrUse::UdpConnect,
+            false,
+            false,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn udp_outgoing_datagram_denied_without_raw_socket_opt_in() {
+        assert!(!socket_addr_permitted(
+            SocketAddrUse::UdpOutgoingDatagram,
+            false,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn udp_outgoing_datagram_allowed_with_raw_socket_opt_in() {
+        assert!(socket_addr_permitted(
+            SocketAddrUse::UdpOutgoingDatagram,
+            false,
+            false,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn udp_bind_allows_only_service_loopback() {
+        assert!(socket_addr_permitted(
+            SocketAddrUse::UdpBind,
+            true,
+            false,
+            true,
+            false,
+        ));
+        assert!(!socket_addr_permitted(
+            SocketAddrUse::UdpBind,
+            false,
+            true,
+            true,
+            false,
+        ));
+        assert!(!socket_addr_permitted(
+            SocketAddrUse::UdpBind,
+            true,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn raw_socket_opt_in_does_not_widen_udp_bind() {
+        assert!(!socket_addr_permitted(
+            SocketAddrUse::UdpBind,
+            false,
+            true,
+            true,
+            true,
+        ));
+        assert!(!socket_addr_permitted(
+            SocketAddrUse::UdpBind,
+            true,
+            false,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn raw_egress_classifies_tcp_and_udp_without_binds() {
+        assert!(is_raw_egress(SocketAddrUse::TcpConnect));
+        assert!(is_raw_egress(SocketAddrUse::UdpConnect));
+        assert!(is_raw_egress(SocketAddrUse::UdpOutgoingDatagram));
+        assert!(!is_raw_egress(SocketAddrUse::TcpBind));
+        assert!(!is_raw_egress(SocketAddrUse::UdpBind));
+    }
+
+    #[tokio::test]
+    async fn allowed_ip_name_lookups_cannot_bypass_raw_udp_denial() {
+        let mut local_resources = crate::types::LocalResources {
+            allowed_ip_name_lookups: vec![
+                "*".parse().expect("allow-all lookup policy should parse"),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        local_resources
+            .config
+            .insert("wamn.allow-raw-sockets".to_string(), "false".to_string());
+
+        let template = ComponentCtxTemplate {
+            component_id: Arc::from("udp-lookup-bypass"),
+            workload_id: Arc::from("udp-lookup-bypass-workload"),
+            local_resources,
+            volume_mounts: Vec::new(),
+            plugins: None,
+            loopback: Arc::new(std::sync::Mutex::new(loopback::Network::default())),
+            #[cfg(feature = "wasi-tls")]
+            tls_provider: None,
+        };
+        let ctx = build_ctx_from_template(
+            &template,
+            Arc::new(crate::host::http::NullServer::default()),
+            &[],
+            "udp-lookup-bypass-store",
+            false,
+        )
+        .await
+        .expect("socket context should build");
+
+        assert_eq!(
+            ctx.sockets.allowed_ip_name_lookups.len(),
+            1,
+            "the allow-all lookup policy must reach the production sockets context",
+        );
+
+        for (addr, reason) in [
+            (
+                std::net::SocketAddr::from(([192, 0, 2, 1], 53)),
+                SocketAddrUse::UdpConnect,
+            ),
+            (
+                std::net::SocketAddr::from(([192, 0, 2, 1], 53)),
+                SocketAddrUse::UdpOutgoingDatagram,
+            ),
+            (
+                std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+                SocketAddrUse::UdpBind,
+            ),
+        ] {
+            let error = ctx
+                .sockets
+                .socket_addr_check
+                .check(addr, reason)
+                .await
+                .expect_err("lookup policy must not grant raw UDP or component UDP bind");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "allow-all lookup policy unexpectedly granted {reason:?}",
+            );
+        }
     }
 }

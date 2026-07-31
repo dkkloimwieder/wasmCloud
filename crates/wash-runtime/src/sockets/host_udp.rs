@@ -59,6 +59,19 @@ fn rebind_outgoing_own(
     Resource::<OutgoingDatagramStream>::new_own(this.rep())
 }
 
+async fn check_unconnected_datagram_address(
+    socket_addr_check: Option<&super::SocketAddrCheck>,
+    addr: SocketAddr,
+) -> SocketResult<()> {
+    let Some(check) = socket_addr_check else {
+        return Err(ErrorCode::InvalidState.into());
+    };
+    check
+        .check(addr, SocketAddrUse::UdpOutgoingDatagram)
+        .await
+        .map_err(super::network::socket_error_from_io)
+}
+
 impl udp::Host for WasiSocketsCtxView<'_> {}
 
 impl udp::HostUdpSocket for WasiSocketsCtxView<'_> {
@@ -527,13 +540,7 @@ impl udp::HostOutgoingDatagramStream for WasiSocketsCtxView<'_> {
                 .map(ip_socket_address_to_socket_addr);
             let addr = match (remote_address, provided_addr) {
                 (None, Some(addr)) => {
-                    let Some(check) = socket_addr_check else {
-                        return Err(ErrorCode::InvalidState.into());
-                    };
-                    check
-                        .check(addr, SocketAddrUse::UdpOutgoingDatagram)
-                        .await
-                        .map_err(super::network::socket_error_from_io)?;
+                    check_unconnected_datagram_address(socket_addr_check, addr).await?;
                     addr
                 }
                 (Some(addr), None) => addr,
@@ -741,5 +748,64 @@ impl From<SocketAddressFamily> for IpAddressFamily {
             SocketAddressFamily::Ipv4 => IpAddressFamily::Ipv4,
             SocketAddressFamily::Ipv6 => IpAddressFamily::Ipv6,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sockets::SocketAddrCheck;
+    use std::sync::{Arc, Mutex};
+
+    fn recording_check(permitted: bool, seen: Arc<Mutex<Vec<&'static str>>>) -> SocketAddrCheck {
+        SocketAddrCheck::new(move |_, reason| {
+            let seen = Arc::clone(&seen);
+            Box::pin(async move {
+                let name = match reason {
+                    SocketAddrUse::UdpOutgoingDatagram => "outgoing-datagram",
+                    _ => "unexpected",
+                };
+                seen.lock()
+                    .expect("recording mutex should not be poisoned")
+                    .push(name);
+                permitted
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn p2_unconnected_send_checks_outgoing_datagram_address() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let check = recording_check(true, Arc::clone(&seen));
+
+        let result = check_unconnected_datagram_address(
+            Some(&check),
+            SocketAddr::from(([192, 0, 2, 1], 53)),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            *seen.lock().expect("recording mutex should not be poisoned"),
+            ["outgoing-datagram"]
+        );
+    }
+
+    #[tokio::test]
+    async fn p2_unconnected_send_denies_disallowed_outgoing_datagram() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let check = recording_check(false, Arc::clone(&seen));
+
+        let result = check_unconnected_datagram_address(
+            Some(&check),
+            SocketAddr::from(([192, 0, 2, 1], 53)),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            *seen.lock().expect("recording mutex should not be poisoned"),
+            ["outgoing-datagram"]
+        );
     }
 }
