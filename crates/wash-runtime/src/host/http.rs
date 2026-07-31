@@ -1459,15 +1459,49 @@ async fn handle_http_request<T: Router>(
     Ok(response)
 }
 
+/// Inbound HTTP requests served by the host, counted by bounded status class.
+static WAMN_API_REQUESTS: std::sync::LazyLock<opentelemetry::metrics::Counter<u64>> =
+    std::sync::LazyLock::new(|| {
+        opentelemetry::global::meter("wamn-host")
+            .u64_counter("wamn.api.requests")
+            .with_description("Inbound HTTP requests served by the host, by status class")
+            .build()
+    });
+
 /// Record the response's status on the current span as the OTel HTTP semconv
 /// attribute `http.response.status_code`. 5xx flips `otel.status_code` to
 /// `ERROR` per the HTTP semconv (4xx is a client error and stays UNSET).
+///
+/// This is also the single request-count choke point shared by routing
+/// failures, long-lived service responses, and ordinary P2/P3 dispatch
+/// (including warm P3 instances).
 fn record_response_status<B>(response: &hyper::Response<B>) {
+    record_response_status_with_counter(response, &WAMN_API_REQUESTS);
+}
+
+fn record_response_status_with_counter<B>(
+    response: &hyper::Response<B>,
+    counter: &opentelemetry::metrics::Counter<u64>,
+) {
     let status = response.status().as_u16();
     let span = tracing::Span::current();
     span.record(HTTP_RESPONSE_STATUS_CODE, status);
     if status >= 500 {
         span.record(OTEL_STATUS_CODE, "ERROR");
+    }
+    counter.add(
+        1,
+        &[KeyValue::new("status_class", http_status_class(status))],
+    );
+}
+
+fn http_status_class(status: u16) -> &'static str {
+    match status / 100 {
+        1 => "1xx",
+        2 => "2xx",
+        3 => "3xx",
+        4 => "4xx",
+        _ => "5xx",
     }
 }
 
@@ -2263,6 +2297,7 @@ async fn send_grpc_request_p3_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry::metrics::SyncInstrument;
     use opentelemetry::trace::{
         SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
     };
@@ -2343,6 +2378,49 @@ mod tests {
 
         assert!(!request.headers().contains_key("traceparent"));
         install_trace_context_propagator();
+    }
+
+    #[derive(Default)]
+    struct RecordingCounter {
+        measurements: std::sync::Mutex<Vec<(u64, Vec<KeyValue>)>>,
+    }
+
+    impl SyncInstrument<u64> for RecordingCounter {
+        fn measure(&self, measurement: u64, attributes: &[KeyValue]) {
+            self.measurements
+                .lock()
+                .unwrap()
+                .push((measurement, attributes.to_vec()));
+        }
+    }
+
+    #[test]
+    fn wamn_api_requests_counts_response_by_status_class() {
+        let recorder = Arc::new(RecordingCounter::default());
+        let counter = opentelemetry::metrics::Counter::new(recorder.clone());
+
+        for status in [204, 404, 503] {
+            let response = hyper::Response::builder().status(status).body(()).unwrap();
+            record_response_status_with_counter(&response, &counter);
+        }
+
+        assert_eq!(
+            *recorder.measurements.lock().unwrap(),
+            vec![
+                (
+                    1,
+                    vec![KeyValue::new("status_class", http_status_class(204))]
+                ),
+                (
+                    1,
+                    vec![KeyValue::new("status_class", http_status_class(404))]
+                ),
+                (
+                    1,
+                    vec![KeyValue::new("status_class", http_status_class(503))]
+                ),
+            ]
+        );
     }
 
     /// Guards the P3 streaming regression fix: `run_http_server` must disable
