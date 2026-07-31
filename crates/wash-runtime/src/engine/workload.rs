@@ -1723,7 +1723,8 @@ impl ResolvedWorkload {
 ///
 /// # Lifecycle
 ///
-/// 1. **Creation**: Built from a [`Workload`] specification via [`Engine::initialize_workload`]
+/// 1. **Creation**: Built from a [`Workload`](crate::types::Workload) specification via
+///    [`Engine::initialize_workload`](crate::engine::Engine::initialize_workload)
 /// 2. **Plugin Binding**: Components are bound to required host plugins
 /// 3. **Resolution**: Dependencies are resolved and the workload becomes [`ResolvedWorkload`]
 /// 4. **Execution**: The resolved workload can create component instances and handle requests

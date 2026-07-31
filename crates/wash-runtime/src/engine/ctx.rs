@@ -185,7 +185,7 @@ pub struct SharedCtx {
     /// resources it has handed out across the bridge. Its presence also marks
     /// this store as the plugin (real) side when relocating `resource` handles —
     /// a caller store leaves it `None` and holds opaque proxies instead. See
-    /// [`crate::engine::store::resource_bridge`].
+    /// `crate::engine::store::resource_bridge`.
     pub resource_registry: Option<crate::engine::store::resource_bridge::ResourceRegistry>,
     /// Per-store component memory budget used by [`wasmtime::Store::limiter`].
     pub wamn_limiter: WamnStoreLimiter,

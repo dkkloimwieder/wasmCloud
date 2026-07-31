@@ -16,14 +16,14 @@
 //! serves them via [`Accessor::spawn`]. Adding another host-invoked interface
 //! (e.g. a messaging handler) is a new [`Ingress`] variant plus a serve arm —
 //! the `cli/run` driving and the single-instance `run_concurrent` are reused.
-//! Each ingress kind lives in its own submodule ([`http`], [`messaging`],
-//! [`capability`]); this module holds the shared [`Ingress`] enum, the
-//! `prepare`/`serve` dispatch, and the [`run_trigger_driver`] loop.
+//! Each ingress kind lives in its own submodule (`http`, `messaging`,
+//! `capability`); this module holds the shared [`Ingress`] enum, the
+//! `prepare`/`serve` dispatch, and the `run_trigger_driver` loop.
 //!
-//! The [`Ingress::Capability`] variant generalizes this to *host component
-//! plugins*: instead of HTTP requests or messages, the host pushes cross-store
-//! capability calls (a workload importing `acme:kv/store`, `wasi:keyvalue`, ...)
-//! as [`CapabilityJob`]s, and the TriggerService serves each on the same long-lived
+//! With the `host-component-plugins` feature, the `Ingress::Capability` variant
+//! generalizes this to *host component plugins*: instead of HTTP requests or messages,
+//! the host pushes cross-store capability calls (a workload importing
+//! `acme:kv/store`, `wasi:keyvalue`, ...) as `CapabilityJob`s, and the TriggerService serves each on the same long-lived
 //! instance — the persistent, concurrent-driven store a host component plugin is
 //! built on. Such a plugin need not export `wasi:cli/run`; the TriggerService treats it
 //! as optional and simply omits the co-driven run loop when it is absent.

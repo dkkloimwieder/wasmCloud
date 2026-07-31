@@ -16,7 +16,6 @@
 //! 2. Routing requests to components based on the Host header
 //! 3. Creating isolated component instances for each request
 //! 4. Managing the request/response lifecycle through WASI-HTTP
-//! ```
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -177,7 +176,7 @@ pub trait Router: Send + Sync + 'static {
 
     /// Register a workload whose long-lived service handles HTTP ingress (the
     /// service exports `wasi:http/handler`). `hostnames` are the ingress
-    /// hostnames the service serves on (see [`http_ingress_hostnames`]); a
+    /// hostnames the service serves on (see `http_ingress_hostnames`); a
     /// hostname-keyed router registers the workload under each so requests
     /// resolve to it. Default: no-op.
     async fn on_service_http_resolved(

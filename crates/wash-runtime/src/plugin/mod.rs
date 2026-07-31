@@ -8,14 +8,14 @@
 //!
 //! Plugins are Rust types that implement the [`HostPlugin`] trait. They:
 //! - Declare which WIT interfaces they provide via [`HostPlugin::world`]
-//! - Bind to components that need their capabilities via [`HostPlugin::bind_component`]
+//! - Bind to components that need their capabilities via [`HostPlugin::on_workload_item_bind`]
 //! - Can participate in workload lifecycle events
 //! - Are automatically linked into the wasmtime runtime
 //!
 //! # Built-in Plugins
 //!
 //! The crate provides several built-in plugins for common WASI interfaces:
-//! - [`wasi_http`] - HTTP server capabilities (`wasi:http/incoming-handler`)
+//! - [`crate::host::http`] - HTTP server capabilities (`wasi:http/incoming-handler`)
 //! - [`wasi_config`] - Runtime configuration (`wasi:config/store`)
 //! - [`wasi_blobstore`] - Object storage (`wasi:blobstore`)
 //! - [`wasi_keyvalue`] - Key-value storage (`wasi:keyvalue`)
@@ -63,7 +63,7 @@ pub mod component_host;
 /// whenever the sources it can name are reachable, independent of
 /// `host-component-plugins`, so front-ends can accept a plugin declaration and
 /// fail clearly when built without that feature; the loader that consumes it
-/// lives in [`component_host`].
+/// lives in `component_host`.
 #[cfg(feature = "oci")]
 pub mod component_plugin_spec;
 #[cfg(feature = "oci")]
@@ -157,7 +157,7 @@ impl WorkloadFailureSink {
 /// imports and exports that will be directly linked to the workload's [`wasmtime::component::Linker`].
 ///
 /// For example, the runtime doesn't implement `wasi:keyvalue`, but it's a key capability for many component
-/// applications. This crate provides a [`wasi_keyvalue::WasiKeyvalue`] built-in that persists key-value data
+/// applications. This crate provides a [`wasi_keyvalue::InMemoryKeyValue`] built-in that persists key-value data
 /// in-memory and implements the component imports of `wasi:keyvalue` atomics, batch and store.
 ///
 /// You can supply your own [`HostPlugin`] implementations to the [`crate::host::HostBuilder::with_plugin`] function.
@@ -175,7 +175,7 @@ pub trait HostPlugin: std::any::Any + Send + Sync + 'static {
     /// Returns the WIT interfaces that this plugin provides.
     ///
     /// The returned `WitWorld` contains the imports and exports that this plugin
-    /// implements. The plugin's `bind_component` method will only be called if
+    /// implements. The plugin's `on_workload_item_bind` method will only be called if
     /// a workload requires one of these interfaces.
     ///
     /// # Returns
@@ -249,7 +249,8 @@ pub trait HostPlugin: std::any::Any + Send + Sync + 'static {
         Ok(())
     }
 
-    /// Called when a [`WorkloadComponent`] or [`WorkloadService`] is being bound to this plugin.
+    /// Called when a [`WorkloadComponent`](crate::engine::workload::WorkloadComponent) or
+    /// [`WorkloadService`](crate::engine::workload::WorkloadService) is being bound to this plugin.
     ///
     /// This method is called when a workload requires interfaces that this
     /// plugin provides. The plugin should configure the component's linker

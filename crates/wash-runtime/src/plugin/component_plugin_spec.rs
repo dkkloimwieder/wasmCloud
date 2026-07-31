@@ -2,8 +2,8 @@
 //! fetch its wasm from.
 //!
 //! A spec is produced from a `wash host --host-plugin` flag string (via
-//! [`FromStr`]) or converted from a `wash dev` config entry, then resolved to a
-//! running plugin by [`super::component_host::load_component_plugin`]. That
+//! [`std::str::FromStr`]) or converted from a `wash dev` config entry, then
+//! resolved to a running plugin by `component_host::load_component_plugin`. That
 //! loader is gated on the `host-component-plugins` feature; this spec type is
 //! always compiled so the CLI can accept a plugin declaration and fail with a
 //! clear error on a build that lacks the feature, rather than silently dropping
