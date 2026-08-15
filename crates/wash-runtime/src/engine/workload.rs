@@ -1829,6 +1829,23 @@ impl ResolvedWorkload {
             "unbinding all plugins from workload"
         );
 
+        // Pull the workload's HTTP routes and drop its egress state (pooled
+        // connections, TLS session store) first, before any plugin unbind can
+        // stall — a guest lifecycle delivery may run out its whole per-call
+        // budget — so no new request routes to a workload whose teardown has
+        // begun. Unconditionally, not gated on any component exporting
+        // wasi:http: a workload that only *imports* wasi:http for egress — or
+        // a service-only workload with no components at all — still builds an
+        // outbound connection pool the moment it sends a request, and this is
+        // the only teardown hook that drops that pool rather than leaving
+        // connections opened under this workload's credential generation warm
+        // for a same-id successor. Log-and-continue like every other step
+        // here: no caller consumes this fn's error, and aborting would strand
+        // the service teardown below.
+        if let Err(e) = self.http_handler.on_workload_unbind(self.id()).await {
+            tracing::error!(workload.id = %self.id(), err = %e, "failed to notify HTTP handler of workload teardown, continuing");
+        }
+
         for component in self.components.read().await.values() {
             // Warm instances hold guest resources (sockets, open files) for as
             // long as they stay parked, so release them with the rest of the
@@ -1872,12 +1889,6 @@ impl ResolvedWorkload {
                 }
             }
 
-            if component.exports_wasi_http() {
-                anyhow::Context::context(
-                    self.http_handler.on_workload_unbind(self.id()).await,
-                    "failed to notify HTTP handler of workload",
-                )?;
-            }
         }
 
         // The service item records plugin bindings just like a component;
@@ -3048,6 +3059,97 @@ mod tests {
             vec![WitInterface::from(MARKER)],
         ));
         HashMap::from([(plugin.id(), plugin as Arc<dyn HostPlugin>)])
+    }
+
+    /// Records `on_workload_unbind` calls; every other method mirrors
+    /// [`crate::host::http::NullServer`].
+    struct UnbindRecordingHandler {
+        unbinds: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl crate::host::http::HostHandler for UnbindRecordingHandler {
+        async fn start(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn stop(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn port(&self) -> u16 {
+            0
+        }
+
+        async fn on_workload_resolved(
+            &self,
+            _resolved_handle: &ResolvedWorkload,
+            _component_id: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn on_workload_unbind(&self, workload_id: &str) -> anyhow::Result<()> {
+            self.unbinds
+                .lock()
+                .expect("recording mutex should not be poisoned")
+                .push(workload_id.to_string());
+            Ok(())
+        }
+
+        fn outgoing_request(
+            &self,
+            _workload_id: &str,
+            _request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
+            _config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
+            _allowed_hosts: &[crate::host::allowed_hosts::AllowedHost],
+        ) -> wasmtime_wasi_http::p2::HttpResult<
+            wasmtime_wasi_http::p2::types::HostFutureIncomingResponse,
+        > {
+            Err(wasmtime_wasi_http::p2::HttpError::trap(
+                wasmtime::format_err!("http client not available"),
+            ))
+        }
+    }
+
+    /// Teardown must notify the HTTP handler even when no component exports
+    /// wasi:http: an egress-only or service-only workload still builds an
+    /// outbound connection pool on its first request, and this notification
+    /// is the only thing that drops that pool (and its TLS session store) at
+    /// stop rather than leaving connections opened under the stopped
+    /// workload's credential generation warm for a same-id successor.
+    #[tokio::test]
+    async fn teardown_unbinds_the_http_handler_without_a_wasi_http_export() {
+        let unbinds = Arc::new(Mutex::new(Vec::new()));
+        let handler = Arc::new(UnbindRecordingHandler {
+            unbinds: Arc::clone(&unbinds),
+        });
+
+        let workload = UnresolvedWorkload::new(
+            "no-http-export".to_string(),
+            "no-http-export".to_string(),
+            "test-namespace".to_string(),
+            None,
+            vec![],
+            vec![],
+        )
+        .resolve(None, handler)
+        .await
+        .expect("a component-less workload should resolve");
+
+        workload
+            .unbind_all_plugins()
+            .await
+            .expect("teardown of a component-less workload should succeed");
+
+        assert_eq!(
+            *unbinds
+                .lock()
+                .expect("recording mutex should not be poisoned"),
+            [workload.id().to_string()],
+            "stop must reach the HTTP handler exactly once for a workload with \
+             no wasi:http export"
+        );
     }
 
     /// Every component id `bind_plugins` reported as bound. Ids are fresh
