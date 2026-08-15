@@ -356,8 +356,9 @@ impl<T: 'static + Send> bindings::wasmcloud::keyvalue::batch::HostWithStore<T> f
 impl bindings::wasmcloud::keyvalue::batch::Host for ActiveCtx<'_> {}
 
 /// A keyvalue [`HostPlugin`] that multiplexes async `wasmcloud:keyvalue` across
-/// backends selected per `(implements ..)` import. Shares the [`KvBackend`]
-/// providers with [`super::multiplexed::MultiplexedKeyValue`].
+/// backends selected per `(implements ..)` import. Shares the
+/// [`KvBackend`](super::KvBackend) providers with
+/// [`super::multiplexed::MultiplexedKeyValue`].
 pub struct MultiplexedAsyncKeyValue {
     mux: Multiplexer<KvId>,
 }

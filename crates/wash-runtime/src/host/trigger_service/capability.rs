@@ -43,10 +43,10 @@ pub enum CapabilityJob {
 
 /// A single cross-store capability call. The host-side shim (installed on a
 /// workload's linker) extracts the call's arguments in the caller store into
-/// store-agnostic [`Relocated`] values, sends them here, and awaits the
-/// [`Relocated`] results on `reply`. Handle-free values are copied;
+/// store-agnostic `Relocated` values, sends them here, and awaits the
+/// `Relocated` results on `reply`. Handle-free values are copied;
 /// `stream<T>`/`future<T>`/`resource` handles are relocated across the boundary
-/// via [`relocate`].
+/// via `relocate`.
 pub struct CapabilityCall {
     /// Interface of the called function (matches a [`CapabilityFunc::interface`]).
     pub interface: Arc<str>,

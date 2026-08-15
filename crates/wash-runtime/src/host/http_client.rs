@@ -30,7 +30,7 @@
 //! store, which honours `SSL_CERT_FILE`/`SSL_CERT_DIR`) with any explicitly
 //! configured PEM bundles layered on top.
 //!
-//! The per-connection helpers ([`connect_tcp`], [`connect_tls`], the
+//! The per-connection helpers (`connect_tcp`, `connect_tls`, the
 //! connection-worker spawners) follow wasmtime's `default_send_request` error
 //! mappings and serve the gRPC egress fast path in `host::http`, which manages
 //! its own HTTP/2 connections rather than going through the pool.
@@ -799,7 +799,7 @@ impl PooledClient {
 /// host-wide ceiling.
 ///
 /// Each workload gets its own [`PooledClient`] (created lazily on first
-/// request, evicted after [`WORKLOAD_CLIENT_IDLE`] without use), so a
+/// request, evicted after `WORKLOAD_CLIENT_IDLE` without use), so a
 /// workload reuses its own keep-alive connections but components never share
 /// a TCP connection with each other. Every client draws new connections from
 /// its own per-workload quota and from the shared host-wide ceiling (see
@@ -870,7 +870,7 @@ impl WorkloadClients {
     /// the workload binds, before it serves anything.
     ///
     /// This sizes the idle cap of the pools built for it (see
-    /// [`idle_per_authority`]): a component that keeps `pool_size` instances
+    /// `idle_per_authority`): a component that keeps `pool_size` instances
     /// warm, each taking `max_concurrency` calls, bursts that many concurrent
     /// guest calls, and each of those may have several outbound requests in
     /// flight. Sizing off a fixed number instead leaves such a component
@@ -938,7 +938,7 @@ impl WorkloadClients {
     ///
     /// The workload's quota deliberately survives, so that the
     /// draining connections stay charged to it; it ages out on its own idle
-    /// window ([`WORKLOAD_CLIENT_IDLE`]) once nothing refers to the workload.
+    /// window (`WORKLOAD_CLIENT_IDLE`) once nothing refers to the workload.
     pub fn invalidate(&self, workload_id: &str) {
         self.clients.invalidate(workload_id);
         // moka may defer dropping the evicted value to a maintenance pass;

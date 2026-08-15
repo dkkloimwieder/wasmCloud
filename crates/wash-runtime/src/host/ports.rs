@@ -44,7 +44,7 @@ impl core::fmt::Display for PortOwner {
 /// new incarnation's bind failing with `AddressInUse` forever.
 ///
 /// So the network is replaced on each restart and reached through this handle.
-/// A [`PublishedPort`] holds the handle rather than the network, which is what
+/// A `PublishedPort` holds the handle rather than the network, which is what
 /// lets the real listener stay bound across a restart: connections arriving
 /// while the new incarnation is coming up simply wait out the readiness window
 /// against the new network.

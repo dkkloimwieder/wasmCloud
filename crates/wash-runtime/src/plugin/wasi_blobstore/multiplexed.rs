@@ -91,7 +91,7 @@ pub struct ObjectInfo {
 
 /// The unified error surface for a [`BlobBackend`]. Named cases map cleanly onto
 /// the async `wasmcloud:blobstore` `variant error`; the `wasi:blobstore` layer
-/// flattens them to its `string` error via [`Display`].
+/// flattens them to its `string` error via [`std::fmt::Display`].
 #[derive(Clone, Debug)]
 pub enum BlobBackendError {
     NoSuchContainer(String),

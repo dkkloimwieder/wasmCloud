@@ -1,20 +1,27 @@
 //! # Generic multiplexing core for `(implements ..)` routing
 //!
 //! The per-builtin multiplexed plugins all share the same set of
-//! [`BackendProvider`]s keyed by a `config.backend` discriminator, a registry
+//! [`BackendProvider`](crate::plugin::multiplex::BackendProvider)s keyed by a
+//! `config.backend` discriminator, a registry
 //! mapping each host-interface name (the implements id) to a backend, and a
-//! [`Multiplexer::resolve`] call that resolves a component import name to its
+//! [`Multiplexer::resolve`](crate::plugin::multiplex::Multiplexer::resolve) call
+//! that resolves a component import name to its
 //! backend.
 //!
 //! ## Connection pool
 //!
-//! Backends whose provider supplies a [`BackendProvider::pool_key`] (redis,
+//! Backends whose provider supplies a
+//! [`BackendProvider::pool_key`](crate::plugin::multiplex::BackendProvider::pool_key)
+//! (redis,
 //! NATS) are cached and shared across workload binds with the same
 //! configuration, so identical interfaces reuse one connection. The pool is
 //! self-managing: a single-flight cell collapses concurrent binds for the same
 //! key into one `instantiate`, an idle entry is reaped after
-//! [`Multiplexer::with_idle_ttl`], and the number of cached connections is
-//! capped by [`Multiplexer::with_max_connections`] (least-recently-used
+//! [`Multiplexer::with_idle_ttl`](crate::plugin::multiplex::Multiplexer::with_idle_ttl),
+//! and the number of cached connections is
+//! capped by
+//! [`Multiplexer::with_max_connections`](crate::plugin::multiplex::Multiplexer::with_max_connections)
+//! (least-recently-used
 //! eviction). The cap bounds *cached* connections; a connection still held by a
 //! live bind keeps working after eviction. Eviction only means a future bind
 //! re-instantiates it.
@@ -157,7 +164,7 @@ impl<Id: Clone + Send + Sync + 'static> Multiplexer<Id> {
     }
 
     /// Override the default pooled-connection ceiling *per backend type*
-    /// (default [`DEFAULT_MAX_CONNECTIONS`]). Once a backend type's pooled
+    /// (default `DEFAULT_MAX_CONNECTIONS`). Once a backend type's pooled
     /// connections would exceed this, its least-recently-used one is evicted;
     /// each backend type is capped independently. Clamped to at least 1. Use
     /// [`with_max_connections_for`](Self::with_max_connections_for) to override
@@ -178,7 +185,7 @@ impl<Id: Clone + Send + Sync + 'static> Multiplexer<Id> {
     }
 
     /// Override the idle period after which a pooled connection is reaped
-    /// (default [`DEFAULT_IDLE_TTL`]).
+    /// (default `DEFAULT_IDLE_TTL`).
     pub fn with_idle_ttl(mut self, ttl: Duration) -> Self {
         self.idle_ttl = ttl;
         self

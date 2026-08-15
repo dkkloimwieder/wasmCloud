@@ -224,7 +224,7 @@ impl WasmcloudPostgres {
     }
 
     /// Build a fresh [`Multiplexer`] for `wasmcloud:postgres` named imports,
-    /// registering the single [`PostgresProvider`]. Exposed so tests can route
+    /// registering the single `PostgresProvider`. Exposed so tests can route
     /// named interfaces to per-credential pools without a full plugin instance.
     pub fn multiplexer() -> Multiplexer<PgId> {
         Multiplexer::new("wasmcloud", "postgres", POSTGRES_BACKEND)

@@ -13,7 +13,7 @@ use crate::plugin::wasi_keyvalue::fs_store::{FsKvError, FsKvStore};
 use super::{KeyResponse, KvBackend, KvId, LIST_KEYS_BATCH_SIZE, StoreError};
 
 /// A filesystem [`KvBackend`] rooted at a directory: buckets are subdirectories,
-/// keys are files (path-traversal guarded). Backed by the shared [`FsKvStore`].
+/// keys are files (path-traversal guarded). Backed by the shared `FsKvStore`.
 pub struct FilesystemBackend {
     store: FsKvStore,
 }

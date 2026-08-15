@@ -473,7 +473,8 @@ impl<D> StreamConsumer<D> for CollectConsumer {
 
 /// A blobstore [`HostPlugin`] that multiplexes async `wasmcloud:blobstore`
 /// across backends selected per `(implements ..)` import. Shares the
-/// [`BlobBackend`] providers with [`super::multiplexed::MultiplexedBlobstore`].
+/// [`BlobBackend`](super::BlobBackend) providers with
+/// [`super::multiplexed::MultiplexedBlobstore`].
 pub struct MultiplexedAsyncBlobstore {
     mux: Multiplexer<BlobId>,
 }

@@ -6,32 +6,37 @@
 //! component plugin runs in **its own long-lived, supervised store** and is
 //! reached across the store boundary. It is the Service co-driver pattern
 //! generalized to host scope: one persistent, `run_concurrent`-driven store
-//! (the [`crate::host::trigger_service::TriggerService`] with a [`Ingress::Capability`]),
+//! (the [`crate::host::trigger_service::TriggerService`] with a
+//! [`Ingress::Capability`](crate::host::trigger_service::Ingress::Capability)),
 //! instantiated once at host start, serving concurrent capability calls from
 //! every workload that imports the interface it exports.
 //!
-//! [`ComponentHostPlugin`] is the adapter that flows a wasm plugin through the
-//! unchanged `bind_plugins` matching machinery:
-//! - [`ComponentHostPlugin::world`] is derived from the component's exported
+//! [`ComponentHostPlugin`](crate::plugin::component_host::ComponentHostPlugin) is
+//! the adapter that flows a wasm plugin through the unchanged `bind_plugins`
+//! matching machinery:
+//! - [`ComponentHostPlugin::world`](crate::plugin::component_host::ComponentHostPlugin::world)
+//!   is derived from the component's exported
 //!   interfaces, so `includes_bidirectional` matches a workload's import.
-//! - [`ComponentHostPlugin::start`] instantiates the persistent store + driver
+//! - [`ComponentHostPlugin::start`](crate::plugin::component_host::ComponentHostPlugin::start)
+//!   instantiates the persistent store + driver
 //!   under supervision.
-//! - [`ComponentHostPlugin::on_workload_item_bind`] installs `func_new_concurrent`
+//! - [`ComponentHostPlugin::on_workload_item_bind`](crate::plugin::component_host::ComponentHostPlugin::on_workload_item_bind)
+//!   installs `func_new_concurrent`
 //!   shims on the workload's linker that route each call to the persistent store
 //!   — instead of `add_to_linker`.
 //!
-//! Arguments and results cross the boundary via [`crate::engine::store::relocate`]:
+//! Arguments and results cross the boundary via `crate::engine::store::relocate`:
 //! handle-free values are copied; `stream<T>`/`future<T>` handles are relocated
 //! (pumped); and `resource` handles are proxied — `own<r>` returns become a
 //! proxy in the caller, `borrow<r>`/method calls route to the real resource in
 //! the plugin store, and dropping the proxy frees it (see
-//! [`crate::engine::store::resource_bridge`]). A plugin may also import an interface it
+//! `crate::engine::store::resource_bridge`). A plugin may also import an interface it
 //! exports (a self-import), wired back to the plugin itself; runaway re-entrant
 //! recursion is bounded by the TriggerService's in-flight-task ceiling. A plugin that
 //! imports `wasmcloud:host/identity` can partition state by its caller's
 //! `(workload_id, component_id)`, attributed exactly under concurrency via the
 //! caller's root guest task (tracked in the per-incarnation
-//! [`crate::host::job_registry::JobRegistry`]). A plugin that imports
+//! `crate::host::job_registry::JobRegistry`). A plugin that imports
 //! `wasmcloud:host/cancel` can cooperatively cancel one of its own in-flight
 //! invocations: `request-cancel` marks the job and the guest unwinds itself
 //! (polling `is-cancelled`, or observing a dropped stream reader) — without
@@ -58,7 +63,7 @@
 //! into — a call out to another workload's guest can trap or stop mid-call, and
 //! the plugin's store is shared by every workload it serves, so the host
 //! answers with a value instead of faulting it.
-//! [`classify_workload_imports`] decides which imports those are, and the
+//! `classify_workload_imports` decides which imports those are, and the
 //! `workload_call` submodule holds the rest: the per-workload routes (claimed in
 //! `on_workload_resolved`, exactly as a native plugin claims them), the
 //! `wasmcloud:host/workload-call` `target` handle a plugin uses to name which
@@ -472,14 +477,14 @@ impl ComponentHostPlugin {
     }
 
     /// Override the number of supervised driver restarts before the plugin is
-    /// declared dead (default [`DEFAULT_MAX_RESTARTS`]).
+    /// declared dead (default `DEFAULT_MAX_RESTARTS`).
     pub fn with_max_restarts(mut self, max_restarts: u32) -> Self {
         self.max_restarts = max_restarts;
         self
     }
 
     /// Override the per-call budget for a lifecycle (bind/unbind) delivery
-    /// (default [`crate::timeouts::plugin_lifecycle_call`]). Bounds how long a
+    /// (default `crate::timeouts::plugin_lifecycle_call`). Bounds how long a
     /// deploy or stop waits on a hook before failing and, for bind, deferring
     /// the rollback unbind.
     pub fn with_lifecycle_call_timeout(self, timeout: Duration) -> Self {

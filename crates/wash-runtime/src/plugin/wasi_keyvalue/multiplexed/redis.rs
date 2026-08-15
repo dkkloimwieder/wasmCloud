@@ -15,7 +15,7 @@ use super::{KeyResponse, KvBackend, KvId, LIST_KEYS_BATCH_SIZE, StoreError};
 ///
 /// Isolation between logical stores is by connection/DB — the `(implements ..)`
 /// label selects the redis URL (and DB, via the url) — or an optional,
-/// operator-set [`prefix`](Self::prefix). The `open(identifier)` bucket name does
+/// operator-set `prefix`. The `open(identifier)` bucket name does
 /// NOT namespace keys, so a guest can open an externally-created keyspace simply
 /// by pointing its label at the right redis. Holds a shared multiplexed
 /// connection (pooled per url+prefix by the provider).
