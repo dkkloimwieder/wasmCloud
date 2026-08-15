@@ -191,6 +191,13 @@ mod tests {
         let output = Command::new("git")
             .args(args)
             .current_dir(repo)
+            // Isolate the fixture from the developer's global/system git
+            // config: e.g. `tag.gpgsign=true` turns the bare `git tag`
+            // below into a signed tag that demands a message and a key.
+            // Identity comes from the repo-local config set in
+            // `init_test_repo`.
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()
             .await
             .expect("git command should run");
