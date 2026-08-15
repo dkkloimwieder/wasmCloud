@@ -1341,10 +1341,9 @@ mod tests {
     /// mode plus an allow-everything host entry. Shaping must close both.
     fn permissive_policy() -> sockets::policy::SocketPolicy {
         sockets::policy::SocketPolicy {
-            allowed_hosts: Arc::from([
-                "*".parse::<crate::host::allowed_hosts::AllowedHost>()
-                    .expect("allow-all host entry should parse"),
-            ]),
+            allowed_hosts: Arc::from(["*"
+                .parse::<crate::host::allowed_hosts::AllowedHost>()
+                .expect("allow-all host entry should parse")]),
             ..Default::default()
         }
     }

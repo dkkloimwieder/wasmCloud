@@ -2001,10 +2001,9 @@ mod tests {
     fn plugin_raw_egress_needs_the_opt_in() {
         use crate::sockets::{AddrDecision, DenyReason, SocketAddrUse};
 
-        let allowed_hosts: Arc<[crate::host::allowed_hosts::AllowedHost]> = Arc::from([
-            "*".parse::<crate::host::allowed_hosts::AllowedHost>()
-                .expect("allow-all host entry should parse"),
-        ]);
+        let allowed_hosts: Arc<[crate::host::allowed_hosts::AllowedHost]> = Arc::from(["*"
+            .parse::<crate::host::allowed_hosts::AllowedHost>()
+            .expect("allow-all host entry should parse")]);
         let bind_addr: std::net::SocketAddr = "10.0.0.5:9000"
             .parse()
             .expect("test bind address should parse");

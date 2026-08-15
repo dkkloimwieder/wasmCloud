@@ -1888,7 +1888,6 @@ impl ResolvedWorkload {
                     }
                 }
             }
-
         }
 
         // The service item records plugin bindings just like a component;
