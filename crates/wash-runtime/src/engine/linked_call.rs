@@ -248,7 +248,11 @@ pub(crate) fn func_is_bridge_safe(func_ty: &ComponentFunc) -> bool {
 }
 
 /// Resolve the raw-sockets opt-in with config taking precedence over the environment.
-fn resolve_allow_raw_sockets(config: Option<&str>, env: Option<&str>) -> bool {
+///
+/// `pub(crate)`: host component plugins resolve the same opt-in from their own
+/// bind-time config (see `plugin::component_host`), so the precedence rule
+/// cannot drift between the two guest kinds.
+pub(crate) fn resolve_allow_raw_sockets(config: Option<&str>, env: Option<&str>) -> bool {
     config
         .map(|value| value.parse::<bool>().unwrap_or(false))
         .or_else(|| env.map(|value| value.parse::<bool>().unwrap_or(false)))
@@ -267,7 +271,7 @@ fn resolve_allow_raw_sockets(config: Option<&str>, env: Option<&str>) -> bool {
 /// granted host-sentinel path are not raw egress and pass through untouched.
 /// With the opt-in, the policy is returned unshaped, so the host-configured
 /// mode, allowlist, and connection quota apply as upstream ships them.
-fn shape_socket_policy(
+pub(crate) fn shape_socket_policy(
     policy: sockets::policy::SocketPolicy,
     allow_raw_sockets: bool,
 ) -> sockets::policy::SocketPolicy {
@@ -282,7 +286,7 @@ fn shape_socket_policy(
 }
 
 /// Return whether a denied operation is raw egress and should emit the warn-once event.
-fn is_raw_egress(reason: SocketAddrUse) -> bool {
+pub(crate) fn is_raw_egress(reason: SocketAddrUse) -> bool {
     matches!(
         reason,
         SocketAddrUse::TcpConnect | SocketAddrUse::UdpConnect | SocketAddrUse::UdpOutgoingDatagram

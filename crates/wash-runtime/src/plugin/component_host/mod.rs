@@ -300,6 +300,11 @@ pub struct ComponentHostPlugin {
     network: crate::host::ports::NetworkHandle,
     /// The host-level half of this plugin's socket policy.
     socket_policy: Arc<crate::sockets::policy::SocketPolicy>,
+    /// The wamn raw-sockets opt-in, resolved at build time from this plugin's
+    /// own config (`wamn.allow-raw-sockets`, env fallback
+    /// `WAMN_ALLOW_RAW_SOCKETS`). Without it the per-incarnation socket
+    /// policy is shaped to deny real raw egress, exactly as a workload's is.
+    allow_raw_sockets: bool,
     state: Arc<ComponentHostPluginState>,
 }
 
@@ -441,6 +446,11 @@ impl ComponentHostPlugin {
                 func: Arc::clone(&lifecycle.unbind.name),
             });
         }
+        let allow_raw_sockets = crate::engine::linked_call::resolve_allow_raw_sockets(
+            config.get("wamn.allow-raw-sockets").map(String::as_str),
+            std::env::var("WAMN_ALLOW_RAW_SOCKETS").ok().as_deref(),
+        );
+
         Ok(Self {
             id,
             engine,
@@ -456,6 +466,7 @@ impl ComponentHostPlugin {
             direct_binds: Arc::from(direct_binds),
             network: crate::host::ports::NetworkHandle::new(),
             socket_policy: socket_policy.unwrap_or_default(),
+            allow_raw_sockets,
             state,
         })
     }
@@ -673,6 +684,7 @@ impl HostPlugin for ComponentHostPlugin {
             self.network.clone(),
             Arc::clone(&self.direct_binds),
             Arc::clone(&self.socket_policy),
+            self.allow_raw_sockets,
         ));
         *self
             .state
@@ -1597,6 +1609,7 @@ async fn run_supervisor(
     network: crate::host::ports::NetworkHandle,
     direct_binds: Arc<[crate::sockets::policy::DirectBind]>,
     socket_policy: Arc<crate::sockets::policy::SocketPolicy>,
+    allow_raw_sockets: bool,
 ) {
     let mut restarts = 0u32;
     loop {
@@ -1612,6 +1625,7 @@ async fn run_supervisor(
             &network,
             &direct_binds,
             &socket_policy,
+            allow_raw_sockets,
         );
         // A fresh job registry per incarnation, published on `state` so the
         // baked-in identity/cancel imports reach this store's live jobs. Stale
@@ -1770,6 +1784,34 @@ async fn run_supervisor(
     }
 }
 
+/// This plugin's per-incarnation socket policy, shaped by the wamn
+/// raw-sockets opt-in exactly as a workload's is
+/// ([`crate::engine::linked_call::shape_socket_policy`]): without the opt-in,
+/// real raw egress is denied outright — a plugin's declared `allowed_hosts`
+/// governs only its `wasi:http`, never raw TCP or UDP. Direct binds, the
+/// plugin's private virtual network, and the host-sentinel grants are not raw
+/// egress and are unaffected either way.
+fn plugin_socket_policy(
+    socket_policy: &crate::sockets::policy::SocketPolicy,
+    allowed_hosts: &Arc<[crate::host::allowed_hosts::AllowedHost]>,
+    direct_binds: &Arc<[crate::sockets::policy::DirectBind]>,
+    id: &str,
+    allow_raw_sockets: bool,
+) -> crate::sockets::policy::SocketPolicy {
+    crate::engine::linked_call::shape_socket_policy(
+        crate::sockets::policy::SocketPolicy {
+            allowed_hosts: Arc::clone(allowed_hosts),
+            ..socket_policy.for_guest(
+                crate::sockets::policy::GuestKind::Plugin {
+                    direct_binds: Arc::clone(direct_binds),
+                },
+                id,
+            )
+        },
+        allow_raw_sockets,
+    )
+}
+
 /// Build the plugin's own store with a minimal host-scoped context. The plugin
 /// is not part of any workload; its `workload_id`/`component_id` are just its
 /// own id. Carries the native plugins this plugin's own imports resolved
@@ -1787,22 +1829,23 @@ fn build_plugin_store(
     network: &crate::host::ports::NetworkHandle,
     direct_binds: &Arc<[crate::sockets::policy::DirectBind]>,
     socket_policy: &Arc<crate::sockets::policy::SocketPolicy>,
+    allow_raw_sockets: bool,
 ) -> Store<SharedCtx> {
     // DNS lookup gated by `allowed_ip_name_lookups`, `wasi:http` gated by
     // `allowed_hosts` (via `Ctx::with_allowed_hosts` + the existing
-    // `check_allowed_hosts`), raw socket connect otherwise unrestricted. Binds
-    // land in the plugin's own private virtual network unless the operator
-    // declared a concrete address for this plugin to hold directly — see
+    // `check_allowed_hosts`), raw socket egress gated by the wamn opt-in via
+    // [`plugin_socket_policy`]. Binds land in the plugin's own private
+    // virtual network unless the operator declared a concrete address for
+    // this plugin to hold directly — see
     // `crate::sockets::policy::SocketPolicy`.
-    let policy = Arc::new(crate::sockets::policy::SocketPolicy {
-        allowed_hosts: Arc::clone(allowed_hosts),
-        ..socket_policy.for_guest(
-            crate::sockets::policy::GuestKind::Plugin {
-                direct_binds: Arc::clone(direct_binds),
-            },
-            id,
-        )
-    });
+    let policy = Arc::new(plugin_socket_policy(
+        socket_policy,
+        allowed_hosts,
+        direct_binds,
+        id,
+        allow_raw_sockets,
+    ));
+    let raw_socket_denial_logged = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // A fresh network per incarnation, published on the handle so a
     // `PublishedPort` bound before this incarnation existed splices into it.
     // It must be fresh: tearing down a store does not release the virtual ports
@@ -1812,7 +1855,36 @@ fn build_plugin_store(
     let sockets_ctx = crate::sockets::WasiSocketsCtx {
         socket_addr_check: crate::sockets::SocketAddrCheck::new(move |addr, reason| {
             let policy = Arc::clone(&policy);
-            Box::pin(async move { policy.decide(reason, addr) })
+            let raw_socket_denial_logged = Arc::clone(&raw_socket_denial_logged);
+            Box::pin(async move {
+                let decision = policy.decide(reason, addr);
+                // Mirror the workload path's warn-once event so an operator
+                // can tell an un-opted-in plugin from a policy
+                // misconfiguration.
+                if !allow_raw_sockets
+                    && crate::engine::linked_call::is_raw_egress(reason)
+                    && matches!(
+                        decision,
+                        crate::sockets::AddrDecision::Deny(
+                            crate::sockets::DenyReason::NotPermitted
+                                | crate::sockets::DenyReason::BlockedRange
+                        )
+                    )
+                    && !raw_socket_denial_logged.swap(true, std::sync::atomic::Ordering::Relaxed)
+                {
+                    warn!(
+                        target: "wamn::sockets",
+                        plugin = %id,
+                        addr = %addr,
+                        reason = ?reason,
+                        "wasi:sockets raw egress denied: host component plugin has not opted \
+                         into raw sockets (set wamn.allow-raw-sockets=true in the plugin's \
+                         config or WAMN_ALLOW_RAW_SOCKETS=true); the plugin's allowed_hosts \
+                         governs only wasi:http"
+                    );
+                }
+                decision
+            })
         }),
         loopback,
         allowed_ip_name_lookups: Arc::clone(allowed_ip_name_lookups),
@@ -1919,6 +1991,60 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
+
+    /// A plugin's raw socket egress is gated on the wamn opt-in, exactly like
+    /// a workload's: without it, neither the host's default count mode nor an
+    /// allow-all `allowed_hosts` entry grants raw TCP, while the operator's
+    /// declared direct binds stay usable. With it, upstream's stock policy
+    /// applies.
+    #[test]
+    fn plugin_raw_egress_needs_the_opt_in() {
+        use crate::sockets::{AddrDecision, DenyReason, SocketAddrUse};
+
+        let allowed_hosts: Arc<[crate::host::allowed_hosts::AllowedHost]> = Arc::from([
+            "*".parse::<crate::host::allowed_hosts::AllowedHost>()
+                .expect("allow-all host entry should parse"),
+        ]);
+        let bind_addr: std::net::SocketAddr = "10.0.0.5:9000"
+            .parse()
+            .expect("test bind address should parse");
+        let direct_binds: Arc<[crate::sockets::policy::DirectBind]> =
+            Arc::from([crate::sockets::policy::DirectBind {
+                addr: bind_addr,
+                udp: false,
+            }]);
+        let base = crate::sockets::policy::SocketPolicy::default();
+        let remote: std::net::SocketAddr = "192.0.2.1:5432"
+            .parse()
+            .expect("test remote address should parse");
+
+        let gated = plugin_socket_policy(&base, &allowed_hosts, &direct_binds, "pg", false);
+        assert!(
+            matches!(
+                gated.decide(SocketAddrUse::TcpConnect, remote),
+                AddrDecision::Deny(DenyReason::NotPermitted)
+            ),
+            "an un-opted-in plugin must not get raw TCP egress, even with an \
+             allow-all allowed_hosts under count mode"
+        );
+        assert!(
+            matches!(
+                gated.decide(SocketAddrUse::TcpBind, bind_addr),
+                AddrDecision::Allow(_)
+            ),
+            "an operator-declared direct bind is not raw egress and must \
+             survive the gate"
+        );
+
+        let opted = plugin_socket_policy(&base, &allowed_hosts, &direct_binds, "pg", true);
+        assert!(
+            matches!(
+                opted.decide(SocketAddrUse::TcpConnect, remote),
+                AddrDecision::Allow(_)
+            ),
+            "the opt-in must restore upstream's host-configured behavior"
+        );
+    }
 
     /// Records the `WorkloadItem::id()` it's bound under — the same accessor
     /// `DynamicConfig` (`wasi:config/store`) keys its per-component config
