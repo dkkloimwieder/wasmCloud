@@ -40,21 +40,40 @@ fn get_socket_mut<'a>(
         .map_err(SocketError::trap)
 }
 
+/// The implicit bind a first `send-to` performs, as the policy permitted it:
+/// the local address to bind and the quota slot the socket holds for it.
+struct ImplicitBind {
+    addr: SocketAddr,
+    slot: Option<crate::host::quota::ConnectionSlot>,
+}
+
+/// Consult the socket policy for an unconnected `send-to`: the datagram's
+/// destination first, then — only if the destination was permitted — the
+/// implicit local bind the first send performs.
+///
+/// Returns the destination's [`Allowed`](crate::sockets::Allowed) verdict
+/// rather than `()`: the address may have been rewritten (an internal-zone
+/// sentinel resolves here) and carries the plane to send on, so the caller
+/// sends to what this returns. The second element is the permitted implicit
+/// bind, when the socket still needs one.
 async fn check_unconnected_send_addresses(
     check: &crate::sockets::SocketAddrCheck,
     remote_address: SocketAddr,
     implicit_bind_address: impl FnOnce() -> SocketResult<Option<SocketAddr>>,
-) -> SocketResult<Option<SocketAddr>> {
-    if !check(remote_address, SocketAddrUse::UdpOutgoingDatagram).await {
-        return Err(ErrorCode::AccessDenied.into());
-    }
-    let implicit_bind_address = implicit_bind_address()?;
-    if let Some(implicit_bind_address) = implicit_bind_address
-        && !check(implicit_bind_address, SocketAddrUse::UdpBind).await
-    {
-        return Err(ErrorCode::AccessDenied.into());
-    }
-    Ok(implicit_bind_address)
+) -> SocketResult<(crate::sockets::Allowed, Option<ImplicitBind>)> {
+    let allowed = check(remote_address, SocketAddrUse::UdpOutgoingDatagram)
+        .await
+        .into_allowed()
+        .map_err(se)?;
+    let Some(addr) = implicit_bind_address()? else {
+        return Ok((allowed, None));
+    };
+    let slot = check(addr, SocketAddrUse::UdpImplicitBind)
+        .await
+        .into_allowed()
+        .map_err(se)?
+        .permit;
+    Ok((allowed, Some(ImplicitBind { addr, slot })))
 }
 
 impl<T> HostUdpSocketWithStore<T> for WasiSockets {
@@ -67,7 +86,13 @@ impl<T> HostUdpSocketWithStore<T> for WasiSockets {
         if data.len() > MAX_UDP_DATAGRAM_SIZE {
             return Err(ErrorCode::DatagramTooLarge.into());
         }
-        let remote_address = remote_address.map(SocketAddr::from);
+        // Reassigned if the policy rewrote it, so the datagram goes where the
+        // policy resolved rather than to the name's sentinel.
+        let mut remote_address = remote_address.map(SocketAddr::from);
+        // The policy's plane for *this* datagram. `None` leaves the choice to
+        // the plane recorded at connect, which is the only other place the
+        // decision was made.
+        let mut plane = None;
 
         if let Some(addr) = remote_address {
             let check = store.with(|mut view| view.get().ctx.socket_addr_check.clone());
@@ -77,7 +102,7 @@ impl<T> HostUdpSocketWithStore<T> for WasiSockets {
             // implicit bind against the network policy (as an explicit `bind`
             // is checked) and then perform it, leaving the socket bound so this
             // runs once rather than on every datagram. (bytecodealliance/wasmtime#13677)
-            let implicit_addr =
+            let (allowed, implicit_bind) =
                 check_unconnected_send_addresses(&check, addr, || {
                     store.with(|mut store| {
                         let view = store.get();
@@ -88,7 +113,13 @@ impl<T> HostUdpSocketWithStore<T> for WasiSockets {
                     })
                 })
                 .await?;
-            if let Some(implicit_addr) = implicit_addr {
+            remote_address = Some(allowed.addr);
+            plane = Some(allowed.plane);
+            if let Some(ImplicitBind {
+                addr: implicit_addr,
+                slot: bind_slot,
+            }) = implicit_bind
+            {
                 store.with(|mut store| {
                     let view = store.get();
                     let mut loopback = view
@@ -99,6 +130,7 @@ impl<T> HostUdpSocketWithStore<T> for WasiSockets {
                     let sock = get_socket_mut(view.table, &socket)?;
                     sock.bind(implicit_addr, &mut loopback).map_err(se)?;
                     sock.finish_bind().map_err(se)?;
+                    sock.hold_quota_slot(bind_slot);
                     SocketResult::Ok(())
                 })?;
             }
@@ -109,6 +141,7 @@ impl<T> HostUdpSocketWithStore<T> for WasiSockets {
                 socket: Arc<tokio::net::UdpSocket>,
                 addr: Option<SocketAddr>,
                 connected: bool,
+                egress_peers: Option<Arc<std::sync::Mutex<std::collections::BTreeSet<SocketAddr>>>>,
             },
             Loopback {
                 local_address: SocketAddr,
@@ -120,7 +153,30 @@ impl<T> HostUdpSocketWithStore<T> for WasiSockets {
         let target = store.with(|mut store| {
             let view = store.get();
             let socket = get_socket_mut(view.table, &socket)?;
+            // The policy decides which network carries the datagram; the socket
+            // only says which halves exist. Dispatching on the variant alone
+            // would send a virtual-plane datagram out the real interface.
+            let plane = plane.or_else(|| socket.connected_plane());
+            let virtual_plane = matches!(plane, Some(crate::sockets::Plane::Virtual));
+            let loopback_half = |lo: &super::loopback::UdpSocket| {
+                let local_address = lo.local_address().map_err(se)?;
+                let addr = match (remote_address, lo.is_connected()) {
+                    (Some(a), _) => a,
+                    (None, true) => lo.remote_address().map_err(se)?,
+                    (None, false) => return Err(se(super::util::ErrorCode::InvalidArgument)),
+                };
+                SocketResult::Ok((local_address, addr))
+            };
             match socket {
+                UdpSocket::Unspecified { net, lo } if virtual_plane => {
+                    let _ = net;
+                    let (local_address, addr) = loopback_half(lo)?;
+                    SocketResult::Ok(SendTarget::Loopback {
+                        local_address,
+                        addr,
+                        loopback: Arc::clone(&view.ctx.loopback),
+                    })
+                }
                 UdpSocket::Network(net) | UdpSocket::Unspecified { net, .. } => {
                     let sock = net.socket().clone();
                     let connected = net.is_connected();
@@ -128,15 +184,19 @@ impl<T> HostUdpSocketWithStore<T> for WasiSockets {
                         socket: sock,
                         addr: remote_address,
                         connected,
+                        egress_peers: net.egress_peers(),
                     })
                 }
+                // Bound to loopback, so this socket has no real half. A
+                // destination the policy put on the host plane — the sentinel
+                // resolved to the machine's own loopback — has nowhere to go
+                // from here, and delivering it virtually would drop it in
+                // silence.
+                UdpSocket::Loopback(_) if matches!(plane, Some(crate::sockets::Plane::Host)) => {
+                    Err(se(super::util::ErrorCode::InvalidArgument))
+                }
                 UdpSocket::Loopback(lo) => {
-                    let local_address = lo.local_address().map_err(se)?;
-                    let addr = match (remote_address, lo.is_connected()) {
-                        (Some(a), _) => a,
-                        (None, true) => lo.remote_address().map_err(se)?,
-                        (None, false) => return Err(se(super::util::ErrorCode::InvalidArgument)),
-                    };
+                    let (local_address, addr) = loopback_half(lo)?;
                     SocketResult::Ok(SendTarget::Loopback {
                         local_address,
                         addr,
@@ -151,8 +211,16 @@ impl<T> HostUdpSocketWithStore<T> for WasiSockets {
                 socket: udp_socket,
                 addr,
                 connected,
+                egress_peers,
             } => match (connected, addr) {
                 (_, Some(a)) => {
+                    // Remember the peer before sending, so its reply is
+                    // admitted by the receive path even if it beats us back.
+                    if let Some(peers) = egress_peers.as_ref()
+                        && let Ok(mut peers) = peers.lock()
+                    {
+                        peers.insert(a);
+                    }
                     udp_socket
                         .send_to(&data, a)
                         .await
@@ -205,6 +273,7 @@ impl<T> HostUdpSocketWithStore<T> for WasiSockets {
             Network {
                 socket: Arc<tokio::net::UdpSocket>,
                 connected_addr: Option<SocketAddr>,
+                egress_peers: Option<Arc<std::sync::Mutex<std::collections::BTreeSet<SocketAddr>>>>,
             },
             Loopback {
                 rx: Arc<
@@ -231,6 +300,7 @@ impl<T> HostUdpSocketWithStore<T> for WasiSockets {
                     SocketResult::Ok(RecvSource::Network {
                         socket: sock,
                         connected_addr: addr,
+                        egress_peers: net.egress_peers(),
                     })
                 }
                 UdpSocket::Loopback(lo) => match &lo.state {
@@ -247,6 +317,7 @@ impl<T> HostUdpSocketWithStore<T> for WasiSockets {
             RecvSource::Network {
                 socket: udp_socket,
                 connected_addr,
+                egress_peers,
             } => {
                 let mut buf = vec![0u8; MAX_UDP_DATAGRAM_SIZE];
                 match connected_addr {
@@ -255,14 +326,24 @@ impl<T> HostUdpSocketWithStore<T> for WasiSockets {
                         buf.truncate(n);
                         (buf, addr)
                     }
-                    None => {
+                    None => loop {
                         let (n, addr) = udp_socket
                             .recv_from(&mut buf)
                             .await
                             .map_err(|e| se(e.into()))?;
+                        // An unspecified-bound socket hears from anyone, so
+                        // deliver only what answers something the guest sent.
+                        // Anything else would make it an unsolicited server on
+                        // a real interface; keep waiting for a real reply
+                        // rather than surfacing a stranger's datagram.
+                        if let Some(peers) = egress_peers.as_ref()
+                            && !peers.lock().is_ok_and(|peers| peers.contains(&addr))
+                        {
+                            continue;
+                        }
                         buf.truncate(n);
-                        (buf, addr)
-                    }
+                        break (buf, addr);
+                    },
                 }
             }
             RecvSource::Loopback { rx } => {
@@ -284,9 +365,11 @@ impl HostUdpSocket for WasiSocketsCtxView<'_> {
         local_address: IpSocketAddress,
     ) -> SocketResult<()> {
         let local_address = SocketAddr::from(local_address);
-        if !(self.ctx.socket_addr_check)(local_address, SocketAddrUse::UdpBind).await {
-            return Err(ErrorCode::AccessDenied.into());
-        }
+        let local_address = (self.ctx.socket_addr_check)(local_address, SocketAddrUse::UdpBind)
+            .await
+            .into_allowed()
+            .map_err(se)?
+            .addr;
         let socket_ref = get_socket_mut(self.table, &socket)?;
         let mut loopback = self
             .ctx
@@ -304,17 +387,20 @@ impl HostUdpSocket for WasiSocketsCtxView<'_> {
         remote_address: IpSocketAddress,
     ) -> SocketResult<()> {
         let remote_address = SocketAddr::from(remote_address);
-        if !(self.ctx.socket_addr_check)(remote_address, SocketAddrUse::UdpConnect).await {
-            return Err(ErrorCode::AccessDenied.into());
-        }
+        let allowed = (self.ctx.socket_addr_check)(remote_address, SocketAddrUse::UdpConnect)
+            .await
+            .into_allowed()
+            .map_err(se)?;
+        let remote_address = allowed.addr;
         let mut loopback = self
             .ctx
             .loopback
             .lock()
             .map_err(|e| SocketError::trap(wasmtime::format_err!("{e}")))?;
         let socket_ref = get_socket_mut(self.table, &socket)?;
+        socket_ref.hold_quota_slot(allowed.permit);
         socket_ref
-            .connect(remote_address, &mut loopback)
+            .connect(remote_address, allowed.plane, &mut loopback)
             .map_err(se)?;
         Ok(())
     }
@@ -437,7 +523,7 @@ impl HostUdpSocket for WasiSocketsCtxView<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sockets::SocketAddrCheck;
+    use crate::sockets::{AddrDecision, DenyReason, SocketAddrCheck};
     use std::sync::Mutex;
 
     fn recording_check(
@@ -445,18 +531,22 @@ mod tests {
         allow_bind: bool,
         seen: Arc<Mutex<Vec<&'static str>>>,
     ) -> SocketAddrCheck {
-        SocketAddrCheck::new(move |_, reason| {
+        SocketAddrCheck::new(move |addr, reason| {
             let seen = Arc::clone(&seen);
             Box::pin(async move {
                 let (name, permitted) = match reason {
                     SocketAddrUse::UdpOutgoingDatagram => ("outgoing-datagram", allow_datagram),
-                    SocketAddrUse::UdpBind => ("implicit-bind", allow_bind),
+                    SocketAddrUse::UdpImplicitBind => ("implicit-bind", allow_bind),
                     _ => ("unexpected", false),
                 };
                 seen.lock()
                     .expect("recording mutex should not be poisoned")
                     .push(name);
-                permitted
+                if permitted {
+                    AddrDecision::allow_by_address(addr)
+                } else {
+                    AddrDecision::Deny(DenyReason::NotPermitted)
+                }
             })
         })
     }
@@ -465,15 +555,20 @@ mod tests {
     async fn p3_unconnected_send_checks_datagram_then_implicit_bind() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let check = recording_check(true, true, Arc::clone(&seen));
+        let remote = SocketAddr::from(([192, 0, 2, 1], 53));
+        let bind = SocketAddr::from(([0, 0, 0, 0], 0));
 
-        let result = check_unconnected_send_addresses(
-            &check,
-            SocketAddr::from(([192, 0, 2, 1], 53)),
-            || Ok(Some(SocketAddr::from(([0, 0, 0, 0], 0)))),
-        )
-        .await;
+        let (allowed, implicit_bind) =
+            check_unconnected_send_addresses(&check, remote, || Ok(Some(bind)))
+                .await
+                .expect("permitted datagram and bind should pass the policy");
 
-        assert!(result.is_ok());
+        assert_eq!(allowed.addr, remote);
+        assert_eq!(
+            implicit_bind.map(|b| b.addr),
+            Some(bind),
+            "the permitted implicit bind address must be handed back to the caller"
+        );
         assert_eq!(
             *seen.lock().expect("recording mutex should not be poisoned"),
             ["outgoing-datagram", "implicit-bind"]

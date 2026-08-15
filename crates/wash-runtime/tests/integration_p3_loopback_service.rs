@@ -49,6 +49,7 @@ fn echo_workload(host: &str, gateway_resources: LocalResources) -> WorkloadStart
                 local_resources: gateway_resources,
                 pool_size: 1,
                 max_invocations: 1000,
+                max_concurrency: 1,
             }],
             host_interfaces: http_only_host_interfaces(host),
             volumes: vec![],
@@ -113,9 +114,20 @@ async fn test_tickless_loopback_service_answers_promptly() -> Result<()> {
     Ok(())
 }
 
-/// Allowing every IP-name lookup must not grant the separate raw-TCP capability.
+/// A workload's own virtual-loopback network is reachable without the
+/// raw-sockets opt-in.
+///
+/// Since the v2.7.0 socket-policy merge, an in-process virtual-loopback
+/// connect is not classified as raw egress: it reaches nothing outside the
+/// workload, so the wamn opt-in gate (which `shape_socket_policy` applies
+/// only to real egress) leaves it open. This pins that deliberate semantic
+/// change — the pre-merge gate denied even this dial without the opt-in.
+/// Real-egress denial without the opt-in (including that allow-all
+/// `allowed_ip_name_lookups` grants no raw TCP or UDP) is pinned by the
+/// `shape_socket_policy` and lookup-bypass unit tests in
+/// `engine::linked_call`.
 #[tokio::test]
-async fn test_allowed_ip_name_lookups_cannot_bypass_raw_tcp_denial() -> Result<()> {
+async fn test_virtual_loopback_works_without_raw_socket_opt_in() -> Result<()> {
     let host_name = "loopback-lookup-only";
     let (addr, host) = start_host_with_p3_http_handler("127.0.0.1:0").await?;
     let mut gateway_resources = LocalResources {
@@ -138,12 +150,12 @@ async fn test_allowed_ip_name_lookups_cannot_bypass_raw_tcp_denial() -> Result<(
             .send(),
     )
     .await
-    .context("lookup-only request timed out instead of receiving TCP denial")?
-    .context("lookup-only request failed before the runtime returned TCP denial")?;
+    .context("virtual-loopback request timed out")?
+    .context("virtual-loopback request failed")?;
 
     anyhow::ensure!(
-        response.status().is_server_error(),
-        "allow-all allowed_ip_name_lookups must not grant raw TCP; got {}",
+        response.status().is_success(),
+        "a workload's virtual loopback must stay reachable without the raw-sockets opt-in; got {}",
         response.status()
     );
 

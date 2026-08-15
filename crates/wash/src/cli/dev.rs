@@ -99,6 +99,11 @@ impl CliCommand for DevCommand {
                 .build(),
         ))?;
 
+        // `wasmcloud:secrets`, served from each workload's bind-time
+        // `secretFrom`-resolved config, same as `wash host`.
+        host_builder = host_builder
+            .with_plugin(Arc::new(plugin::wasmcloud_secrets::WasmcloudSecrets::new()))?;
+
         // Shared data-plane NATS connection, mirroring `wash host`
         // `--data-nats-url`. When `dev.data_nats_url` is set it backs
         // blobstore, keyvalue, and messaging unless a per-plugin config overrides
@@ -149,22 +154,6 @@ impl CliCommand for DevCommand {
             debug!("WASI Blobstore plugin registered with in-memory backend");
         }
 
-        // Host component plugins: WebAssembly components that provide host
-        // capabilities, each in its own supervised store. Fetched (local file or
-        // OCI) and registered before the host starts.
-        #[cfg(feature = "host-component-plugins")]
-        for hp in &dev_config.host_plugins {
-            let spec = hp.to_spec()?;
-            let plugin = wash_runtime::plugin::component_host::load_component_plugin(
-                &spec,
-                &engine,
-                oci_config.clone(),
-            )
-            .await
-            .with_context(|| format!("failed to load host component plugin '{}'", spec.id))?;
-            host_builder = host_builder.with_plugin(plugin)?;
-            debug!(id = %spec.id, "host component plugin registered");
-        }
         #[cfg(not(feature = "host-component-plugins"))]
         ensure!(
             dev_config.host_plugins.is_empty(),
@@ -172,8 +161,30 @@ impl CliCommand for DevCommand {
         );
 
         let http_handler = wash_runtime::host::http::DevRouter::default();
+
+        // One registry for every surface: HTTP pool, raw sockets, inbound
+        // published ports.
+        let quotas = dev_config.connection_quotas()?;
+
+        // Outbound (egress) trust roots for the component's outgoing HTTPS
+        // calls. Distinct from `tls_*_path` below, which configure the ingress
+        // HTTP server.
+        let outgoing_handler = wash_runtime::host::http::DefaultOutgoingHandler::from_tls_options(
+            wash_runtime::host::http_client::ClientTlsOptions {
+                roots: dev_config.http_client_trust_roots.into(),
+                extra_ca_paths: dev_config.http_client_ca_paths.clone(),
+            },
+        )
+        .context("failed to load dev.http_client_ca_paths CA certificates")?
+        // The same registry the socket policy uses, so a component's HTTP
+        // pool and its raw sockets share one configured allowance.
+        .with_quotas(Arc::clone(&quotas));
+
         // TODO(#19): Only spawn the server if the component exports wasi:http
         // Configure HTTP server with optional TLS, enable HTTP Server
+        let mut ingress_builder =
+            wash_runtime::host::http::Ingress::builder(http_handler, http_addr.parse()?)
+                .outgoing_handler(outgoing_handler);
         let protocol = if let (Some(cert_path), Some(key_path)) =
             (&dev_config.tls_cert_path, &dev_config.tls_key_path)
         {
@@ -200,24 +211,16 @@ impl CliCommand for DevCommand {
             if let Some(ca) = dev_config.tls_ca_path.as_deref() {
                 tls = tls.with_ca(ca);
             }
-            let ingress = wash_runtime::host::http::Ingress::new_with_tls(
-                http_handler,
-                http_addr.parse()?,
-                tls,
-            )
-            .await?;
-
-            host_builder = host_builder.with_http_handler(Arc::new(ingress));
+            ingress_builder = ingress_builder.tls(tls);
 
             debug!("TLS configured - server will use HTTPS");
             "https"
         } else {
             debug!("No TLS configuration provided - server will use HTTP");
-            let ingress =
-                wash_runtime::host::http::Ingress::new(http_handler, http_addr.parse()?).await?;
-            host_builder = host_builder.with_http_handler(Arc::new(ingress));
             "http"
         };
+        let ingress = ingress_builder.build().await?;
+        host_builder = host_builder.with_http_handler(Arc::new(ingress));
 
         // Add logging plugin
         host_builder =
@@ -302,6 +305,33 @@ impl CliCommand for DevCommand {
             host_builder =
                 host_builder.with_plugin(Arc::new(plugin::wasi_webgpu::WebGpu::default()))?;
             debug!("WASI WebGPU plugin registered");
+        }
+
+        // Host component plugins: WebAssembly components that provide host
+        // capabilities, each in its own supervised store. Fetched (local file or
+        // OCI) and registered before the host starts — last, so every native
+        // plugin above is already registered and a loading plugin's own
+        // capability imports (config, secrets, keyvalue, ...) can resolve
+        // against the full native set.
+        #[cfg(feature = "host-component-plugins")]
+        {
+            let native_plugins = host_builder.native_plugins();
+            let http_handler = host_builder.http_handler();
+            for hp in &dev_config.host_plugins {
+                let spec = hp.to_spec(&config, project_dir, Some(project_dir))?;
+                let plugin = wash_runtime::plugin::component_host::load_component_plugin(
+                    &spec,
+                    &engine,
+                    oci_config.clone(),
+                    &native_plugins,
+                    http_handler.clone(),
+                    None,
+                )
+                .await
+                .with_context(|| format!("failed to load host component plugin '{}'", spec.id))?;
+                host_builder = host_builder.with_plugin(plugin)?;
+                debug!(id = %spec.id, "host component plugin registered");
+            }
         }
 
         // Build and start the host
@@ -406,6 +436,7 @@ struct SidecarComponent {
     /// `maxInvocations`, `None` where the config left them unset.
     pool_size: Option<i32>,
     max_invocations: Option<i32>,
+    max_concurrency: Option<i32>,
 }
 
 /// Thin wrapper around [`build_workload`]: extracts dev-component
@@ -453,6 +484,7 @@ async fn create_workload(
             workload,
             pool_size: dev_component.pool_size,
             max_invocations: dev_component.max_invocations,
+            max_concurrency: dev_component.max_concurrency,
         });
     }
 
@@ -549,6 +581,7 @@ fn build_workload(
         config: w.config.clone(),
         allowed_hosts: w.allowed_hosts.clone().into(),
         allowed_ip_name_lookups: w.allowed_ip_name_lookups.clone().into(),
+        allowed_host_loopback_ports: w.allowed_host_loopback_ports.clone().into(),
         ..Default::default()
     };
 
@@ -569,6 +602,7 @@ fn build_workload(
             local_resources: local_resources_for(resolved_workload),
             pool_size: UNSET_LIMIT,
             max_invocations: UNSET_LIMIT,
+            max_concurrency: UNSET_LIMIT,
         });
 
         if let Some(service_bytes) = service_bytes {
@@ -592,6 +626,7 @@ fn build_workload(
             // `InstancePolicy`.
             pool_size: sidecar.pool_size.unwrap_or(UNSET_LIMIT),
             max_invocations: sidecar.max_invocations.unwrap_or(UNSET_LIMIT),
+            max_concurrency: sidecar.max_concurrency.unwrap_or(UNSET_LIMIT),
         });
     }
 
@@ -634,11 +669,23 @@ fn build_workload_host_interfaces(
             if interface.namespace == "wasi" && interface.package == "config" {
                 any_imports_wasi_config = true;
             }
-            if !base
-                .iter()
-                .any(|i| i.namespace == interface.namespace && i.package == interface.package)
+            // Introspection yields one `WitInterface` per imported instance
+            // (e.g. `wasmcloud:secrets/store` and `.../reveal` arrive
+            // separately), so a namespace:package match against an existing
+            // entry must union interface names into it rather than drop the
+            // new one — dropping silently lost whichever of store/reveal
+            // didn't win the (HashSet-ordered, nondeterministic) race to
+            // populate `base` first.
+            match base
+                .iter_mut()
+                .find(|i| i.namespace == interface.namespace && i.package == interface.package)
             {
-                base.push(interface.clone());
+                Some(existing) => {
+                    existing
+                        .interfaces
+                        .extend(interface.interfaces.iter().cloned());
+                }
+                None => base.push(interface.clone()),
             }
         }
     }
@@ -726,6 +773,17 @@ mod tests {
         i
     }
 
+    /// Like `iface`, but with one named interface set — introspection yields
+    /// one `WitInterface` per imported instance, so e.g.
+    /// `wasmcloud:secrets/store` and `.../reveal` arrive as two separate
+    /// values with the same namespace:package, each naming only its own
+    /// interface.
+    fn iface_named(namespace: &str, package: &str, interface: &str) -> WitInterface {
+        let mut i = iface(namespace, package);
+        i.interfaces.insert(interface.into());
+        i
+    }
+
     fn find_iface<'a>(
         list: &'a [WitInterface],
         namespace: &str,
@@ -755,6 +813,7 @@ mod tests {
             workload,
             pool_size: None,
             max_invocations: None,
+            max_concurrency: None,
         }
     }
 
@@ -773,6 +832,7 @@ mod tests {
             config: HashMap::from([("flag".into(), "on".into())]),
             allowed_hosts: vec!["https://api.example.com".parse().unwrap()],
             allowed_ip_name_lookups: vec!["*".parse().unwrap()],
+            allowed_host_loopback_ports: vec![],
         };
         let dev_cfg = DevConfig {
             components: vec![dev_component_named("sidecar-a")],
@@ -886,6 +946,7 @@ mod tests {
             config: HashMap::from([("flag".into(), "on".into())]),
             allowed_hosts: vec!["https://api.example.com".parse().unwrap()],
             allowed_ip_name_lookups: vec![],
+            allowed_host_loopback_ports: vec![],
         };
         let dev_cfg = DevConfig {
             components: vec![dev_component_named("sidecar-a")],
@@ -1053,6 +1114,7 @@ mod tests {
             workload: ResolvedWorkload::default(),
             pool_size: None,
             max_invocations: None,
+            max_concurrency: None,
         }];
 
         let workload = build_workload(
@@ -1296,5 +1358,39 @@ mod tests {
             .filter(|i| i.namespace == "wasi" && i.package == "http")
             .count();
         assert_eq!(http_count, 1);
+    }
+
+    #[test]
+    fn distinct_interfaces_of_the_same_package_are_unioned_not_dropped() {
+        // A single component importing `wasmcloud:secrets/store` and
+        // `.../reveal` introspects as two separate WitInterface values
+        // (same namespace:package, each naming only its own interface) —
+        // both must survive into one merged entry. Regression test: the
+        // namespace:package dedup used to treat "an entry already exists"
+        // as "nothing more to do", silently dropping whichever of the two
+        // didn't win the (HashSet-ordered) race to arrive first — a
+        // component plugin then failed to instantiate because the host only
+        // wired a shim for the interface that survived.
+        let comp = HashSet::from([
+            iface_named("wasmcloud", "secrets", "store"),
+            iface_named("wasmcloud", "secrets", "reveal"),
+        ]);
+        let result = build_workload_host_interfaces(Vec::new(), &[comp], &HashMap::new());
+
+        let secrets: Vec<_> = result
+            .iter()
+            .filter(|i| i.namespace == "wasmcloud" && i.package == "secrets")
+            .collect();
+        assert_eq!(
+            secrets.len(),
+            1,
+            "store and reveal must merge into one wasmcloud:secrets entry, got {}",
+            secrets.len()
+        );
+        assert!(
+            secrets[0].interfaces.contains("store") && secrets[0].interfaces.contains("reveal"),
+            "merged entry must carry both interface names, got {:?}",
+            secrets[0].interfaces
+        );
     }
 }

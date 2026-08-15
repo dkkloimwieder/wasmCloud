@@ -39,11 +39,17 @@ fn echo_client_workload_request(
                 local_resources: LocalResources {
                     memory_limit_mb: 256,
                     cpu_limit: 1,
-                    config: HashMap::new(),
+                    // Raw TCP egress to the (non-loopback) echo server needs
+                    // the wamn raw-sockets opt-in.
+                    config: HashMap::from([(
+                        "wamn.allow-raw-sockets".to_string(),
+                        "true".to_string(),
+                    )]),
                     environment: HashMap::from([("ECHO_ADDR".to_string(), echo_addr.to_string())]),
                     volume_mounts: vec![],
                     allowed_hosts: Default::default(),
                     allowed_ip_name_lookups: Default::default(),
+                    allowed_host_loopback_ports: Default::default(),
                 },
                 max_restarts: 0,
             }),

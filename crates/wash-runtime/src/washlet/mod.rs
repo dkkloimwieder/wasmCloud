@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::component_source::ComponentSource;
+use crate::component_source::{ComponentSource, LoadedComponent};
 use crate::host::{Host, HostApi, HostConfig};
 use crate::oci::{self, OciConfig};
 use crate::plugin::HostPlugin;
@@ -75,6 +75,20 @@ impl ClusterHostBuilder {
     pub fn with_plugin<T: HostPlugin>(mut self, plugin: Arc<T>) -> anyhow::Result<Self> {
         self.host_builder = self.host_builder.with_plugin(plugin)?;
         Ok(self)
+    }
+
+    /// Every native (non-component) plugin registered so far. See
+    /// [`crate::host::HostBuilder::native_plugins`].
+    #[cfg(feature = "host-component-plugins")]
+    pub fn native_plugins(&self) -> std::collections::HashMap<&'static str, Arc<dyn HostPlugin>> {
+        self.host_builder.native_plugins()
+    }
+
+    /// The HTTP handler registered so far, if any. See
+    /// [`crate::host::HostBuilder::http_handler`].
+    #[cfg(feature = "host-component-plugins")]
+    pub fn http_handler(&self) -> Option<Arc<dyn crate::host::http::HostHandler>> {
+        self.host_builder.http_handler()
     }
 
     /// Registers the multiplexed plugin set. See
@@ -375,6 +389,30 @@ fn image_pull_secret_to_oci_config(
     oci_config
 }
 
+/// Build the runtime's component from the one on the wire, once its image has
+/// been pulled and its resources parsed.
+///
+/// Every field the wire carries has to land here: one dropped in this
+/// conversion is unreachable from a deployed workload while looking wired
+/// everywhere else. Split out from the pull loop so that stays true under test
+/// without an image pull. The instance limits travel verbatim — the runtime
+/// decodes them once, in [`crate::engine::InstancePolicy`].
+fn component_from_wire(
+    wire: &types::v2::Component,
+    loaded: LoadedComponent,
+    local_resources: crate::types::LocalResources,
+) -> crate::types::Component {
+    crate::types::Component {
+        name: wire.name.clone(),
+        bytes: loaded.bytes,
+        digest: loaded.digest,
+        local_resources,
+        pool_size: wire.pool_size,
+        max_invocations: wire.max_invocations,
+        max_concurrency: wire.max_concurrency,
+    }
+}
+
 #[instrument(level = "debug", skip_all)]
 async fn host_heartbeat(host: &impl HostApi) -> anyhow::Result<types::v2::HostHeartbeat> {
     let hb = host.heartbeat().await?;
@@ -453,14 +491,7 @@ async fn workload_start(
                 },
                 None => crate::types::LocalResources::default(),
             };
-            pulled_components.push(crate::types::Component {
-                name: component.name.clone(),
-                bytes: loaded.bytes,
-                digest: loaded.digest,
-                local_resources,
-                pool_size: component.pool_size,
-                max_invocations: component.max_invocations,
-            })
+            pulled_components.push(component_from_wire(component, loaded, local_resources))
         }
         (
             pulled_components,
@@ -639,6 +670,10 @@ impl TryFrom<types::v2::LocalResources> for crate::types::LocalResources {
                 &lr.allowed_ip_name_lookups,
                 "allowed_ip_name_lookups",
             )?,
+            allowed_host_loopback_ports: parse_policy_entries(
+                &lr.allowed_host_loopback_ports,
+                "allowed_host_loopback_ports",
+            )?,
         })
     }
 }
@@ -779,6 +814,46 @@ mod tests {
     use crate::host::allowed_hosts::AllowedHost;
     use crate::host::allowed_ip_name::AllowedIpName;
 
+    /// Every instance limit a component declares on the wire has to reach the
+    /// runtime. An in-process test builds `types::Component` directly and so
+    /// never crosses this conversion, which is where a limit that exists on
+    /// both sides can go missing — leaving the knob unreachable from a
+    /// workload deployed through the operator.
+    #[test]
+    fn wire_limits_reach_the_runtime() {
+        let wire = types::v2::Component {
+            name: "pooled".to_string(),
+            pool_size: 4,
+            max_invocations: 100,
+            max_concurrency: 8,
+            ..Default::default()
+        };
+
+        let component = component_from_wire(
+            &wire,
+            LoadedComponent {
+                bytes: b"\0asm".as_slice().into(),
+                digest: Some("sha256:abc".to_string()),
+            },
+            crate::types::LocalResources::default(),
+        );
+        assert_eq!(component.name, "pooled");
+        assert_eq!(component.digest.as_deref(), Some("sha256:abc"));
+        assert_eq!(component.pool_size, 4);
+        assert_eq!(component.max_invocations, 100);
+        assert_eq!(component.max_concurrency, 8);
+
+        // And the runtime reads those limits as the policy they name.
+        assert_eq!(
+            crate::engine::InstancePolicy::from_component(&component),
+            crate::engine::InstancePolicy::Warm {
+                pool_size: std::num::NonZeroUsize::new(4).unwrap(),
+                max_invocations: std::num::NonZeroUsize::new(100),
+                max_concurrency: std::num::NonZeroUsize::new(8).unwrap(),
+            }
+        );
+    }
+
     #[test]
     fn try_from_v2_local_resources_parses_allowed_hosts() {
         // Strings flowing in from the proto wire are parsed into typed
@@ -796,6 +871,7 @@ mod tests {
                 "https://api.example.com".to_string(),
             ],
             allowed_ip_name_lookups: vec!["*.example.com".to_string(), "127.0.0.1".to_string()],
+            allowed_host_loopback_ports: vec![],
         };
         let lr = crate::types::LocalResources::try_from(proto).expect("conversion should succeed");
         assert_eq!(lr.allowed_ip_name_lookups.len(), 2);
@@ -832,6 +908,7 @@ mod tests {
             volume_mounts: vec![],
             allowed_hosts: vec!["*com".to_string()],
             allowed_ip_name_lookups: vec![],
+            allowed_host_loopback_ports: vec![],
         };
         let err = crate::types::LocalResources::try_from(proto)
             .expect_err("conversion should reject ambiguous wildcard");
@@ -860,6 +937,7 @@ mod tests {
                 "example.com:notaport".to_string(),       // bad port
             ],
             allowed_ip_name_lookups: vec![],
+            allowed_host_loopback_ports: vec![],
         };
         let err = crate::types::LocalResources::try_from(proto)
             .expect_err("conversion should reject all bad entries");

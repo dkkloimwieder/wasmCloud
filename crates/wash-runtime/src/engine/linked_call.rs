@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::RwLock;
 use tokio::time::timeout;
-use tracing::trace;
+use tracing::{debug, trace};
 use wasmtime::component::{
     Accessor, ComponentExportIndex, InstancePre, Val,
     types::{ComponentFunc, Type},
@@ -37,7 +37,8 @@ use crate::engine::ctx::SharedTlsProvider;
 use crate::engine::ctx::{
     AccessorActiveCtxGuard, Ctx, SharedCtx, StoreActiveCtxGuard, WamnStoreLimiter,
 };
-use crate::engine::instance_pool::{self, ComponentInstance, InstancePool};
+use crate::engine::instance_driver::{InstanceJob, LinkedJob};
+use crate::engine::instance_pool::{self, ComponentInstance, Dispatch, InstancePool};
 use crate::engine::store::relocate::{self, Relocated, bridgeable_element_type};
 use crate::engine::store::stream_pump::Done;
 use crate::engine::value::{carries_cross_store_handle, lift_results, lower_params};
@@ -72,6 +73,12 @@ pub(crate) struct ComponentCtxTemplate {
     volume_mounts: Vec<ResolvedVolumeMount>,
     plugins: Option<HashMap<&'static str, Arc<dyn HostPlugin + Send + Sync>>>,
     loopback: Arc<std::sync::Mutex<loopback::Network>>,
+    /// The host-level half of this component's socket policy: enforcement mode,
+    /// address ranges, whether host-loopback access is enabled at all, and the
+    /// budget. The workload-level half (`allowedHosts`,
+    /// `allowedHostLoopbackPorts`) comes from `local_resources` and is layered over
+    /// this when the check is built.
+    socket_policy: Arc<crate::sockets::policy::SocketPolicy>,
     #[cfg(feature = "wasi-tls")]
     tls_provider: Option<SharedTlsProvider>,
 }
@@ -85,6 +92,7 @@ impl ComponentCtxTemplate {
             volume_mounts: metadata.resolved_volume_mounts.clone(),
             plugins: metadata.plugins.clone(),
             loopback: metadata.loopback.clone(),
+            socket_policy: metadata.socket_policy.clone(),
             #[cfg(feature = "wasi-tls")]
             tls_provider: None,
         }
@@ -123,20 +131,24 @@ pub(crate) fn component_ctx_template_from_metadata_with_tls(
 ///   instantiated once into the caller's long-lived store and reused
 ///   ([`invoke_shared_store_linked_export`]).
 /// - **Ephemeral path** — used when every parameter and result is a *plain
-///   value* (no cross-store handle). The call runs in a brand-new store that is
-///   instantiated, invoked, and dropped per call
+///   value* (no cross-store handle). Plain values copy cleanly across the
+///   store boundary, so nothing is lost by not sharing a store. When the
+///   callee's transitive link closure has opted into instance pooling
+///   (`pool_size > 0`), the call may instead be served by a warm pooled
+///   instance, which keeps one store — and its linear memory — alive across
+///   calls; otherwise (the default) the call runs in a brand-new store that
+///   is instantiated, invoked, and dropped per call
 ///   ([`invoke_ephemeral_linked_export`]), so its core-instance slots are
-///   reclaimed immediately. Plain values copy cleanly across the store
-///   boundary, so nothing is lost by not sharing a store.
+///   reclaimed immediately.
 ///
 /// This struct is the captured input for that second path. One
 /// `Arc<EphemeralLinkedCall>` is built per eligible import during
-/// `link_components` and stored on the [`LinkedExportInvocation`]; each call
-/// hands it to [`new_ephemeral_store`], which rebuilds the active + linked
-/// [`ComponentCtxTemplate`]s from current metadata (`components`),
-/// pre-instantiates the linked components into the fresh store, and runs the
-/// export. Wrapped in `Arc` so the per-call clone is a pointer bump rather than
-/// a deep copy of the engine/handler/component map.
+/// `link_components` and stored on the [`LinkedExportInvocation`]; on the
+/// fresh-store route each call hands it to [`new_ephemeral_store`], which
+/// rebuilds the active + linked [`ComponentCtxTemplate`]s from current
+/// metadata (`components`), pre-instantiates the linked components into the
+/// fresh store, and runs the export. Wrapped in `Arc` so the per-call clone is
+/// a pointer bump rather than a deep copy of the engine/handler/component map.
 #[derive(Clone)]
 pub(crate) struct EphemeralLinkedCall {
     pub(crate) engine: wasmtime::Engine,
@@ -167,6 +179,15 @@ pub(crate) enum EphemeralCallMode {
 
 fn type_is_ephemeral_safe(ty: &Type) -> bool {
     !carries_cross_store_handle(ty)
+}
+
+/// Whether every one of `tys` is a plain value, so a call carrying them copies
+/// cleanly into an ephemeral store. The type-list form of
+/// [`func_is_ephemeral_safe`], for a caller holding params and results
+/// separately rather than as one [`ComponentFunc`].
+#[cfg(feature = "host-component-plugins")]
+pub(crate) fn types_are_ephemeral_safe(tys: &[Type]) -> bool {
+    tys.iter().all(type_is_ephemeral_safe)
 }
 
 pub(crate) fn func_is_ephemeral_safe(func_ty: &ComponentFunc) -> bool {
@@ -210,6 +231,14 @@ fn type_is_bridge_safe(ty: &Type) -> bool {
     }
 }
 
+/// Whether every one of `tys` is [`type_is_bridge_safe`]. The type-list form of
+/// [`func_is_bridge_safe`], for a caller holding params and results separately
+/// rather than as one [`ComponentFunc`].
+#[cfg(feature = "host-component-plugins")]
+pub(crate) fn types_are_bridge_safe(tys: &[Type]) -> bool {
+    tys.iter().all(type_is_bridge_safe)
+}
+
 /// Whether every param/result of `func_ty` is [`type_is_bridge_safe`], so a call
 /// carrying a `stream<T>`/`future<T>` can still run in an ephemeral store (with
 /// relocation) instead of being pinned to the shared store.
@@ -226,19 +255,29 @@ fn resolve_allow_raw_sockets(config: Option<&str>, env: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
-/// Decide whether the component may use `addr` for the requested socket operation.
-fn socket_addr_permitted(
-    reason: SocketAddrUse,
-    ip_is_loopback: bool,
-    _ip_is_unspecified: bool,
-    is_service: bool,
+/// Shape a guest's socket policy around the wamn raw-sockets opt-in.
+///
+/// Without the opt-in, real socket egress is denied outright: the allowlist is
+/// emptied and the mode forced to `Enforce`, so
+/// [`SocketPolicy::decide`](sockets::policy::SocketPolicy::decide) refuses
+/// every non-virtual connect and outgoing datagram at its allowlist layer.
+/// The host's default `Count` mode would evaluate and then allow, and an
+/// `allowedHosts` entry governs only `wasi:http` — neither may grant raw TCP
+/// or UDP. Virtual-loopback traffic (in-process only) and the explicitly
+/// granted host-sentinel path are not raw egress and pass through untouched.
+/// With the opt-in, the policy is returned unshaped, so the host-configured
+/// mode, allowlist, and connection quota apply as upstream ships them.
+fn shape_socket_policy(
+    policy: sockets::policy::SocketPolicy,
     allow_raw_sockets: bool,
-) -> bool {
-    match reason {
-        SocketAddrUse::TcpBind | SocketAddrUse::UdpBind => is_service && ip_is_loopback,
-        SocketAddrUse::TcpConnect => allow_raw_sockets,
-        SocketAddrUse::UdpConnect => allow_raw_sockets,
-        SocketAddrUse::UdpOutgoingDatagram => allow_raw_sockets,
+) -> sockets::policy::SocketPolicy {
+    if allow_raw_sockets {
+        return policy;
+    }
+    sockets::policy::SocketPolicy {
+        allowed_hosts: Arc::from([]),
+        egress_mode: sockets::policy::EgressMode::Enforce,
+        ..policy
     }
 }
 
@@ -285,20 +324,42 @@ async fn build_ctx_from_template(
     let raw_socket_component = Arc::clone(&template.component_id);
     let raw_socket_denial_logged = Arc::new(AtomicBool::new(false));
 
+    let kind = if is_service {
+        sockets::policy::GuestKind::Service
+    } else {
+        sockets::policy::GuestKind::Component
+    };
+    // Keyed on the workload, not the component: a workload's components share
+    // one allowance, the same way they share one virtual network.
+    let policy = Arc::new(shape_socket_policy(
+        sockets::policy::SocketPolicy {
+            allowed_hosts: Arc::clone(&template.local_resources.allowed_hosts),
+            host_loopback: Arc::clone(&template.local_resources.allowed_host_loopback_ports),
+            ..template
+                .socket_policy
+                .for_guest(kind, &template.workload_id)
+        },
+        allow_raw_sockets,
+    ));
     let sockets_ctx = sockets::WasiSocketsCtx {
         socket_addr_check: sockets::SocketAddrCheck::new(move |addr, reason| {
+            let policy = Arc::clone(&policy);
             let raw_socket_component = Arc::clone(&raw_socket_component);
             let raw_socket_denial_logged = Arc::clone(&raw_socket_denial_logged);
             Box::pin(async move {
-                let permitted = socket_addr_permitted(
-                    reason,
-                    addr.ip().is_loopback(),
-                    addr.ip().is_unspecified(),
-                    is_service,
-                    allow_raw_sockets,
-                );
-                if !permitted
+                let decision = policy.decide(reason, addr);
+                // The shaped policy refuses real egress at its allowlist
+                // layer when the opt-in is absent; surface that refusal once
+                // per component so an operator can tell it from a policy
+                // misconfiguration.
+                if !allow_raw_sockets
                     && is_raw_egress(reason)
+                    && matches!(
+                        decision,
+                        sockets::AddrDecision::Deny(
+                            sockets::DenyReason::NotPermitted | sockets::DenyReason::BlockedRange
+                        )
+                    )
                     && !raw_socket_denial_logged.swap(true, Ordering::Relaxed)
                 {
                     tracing::warn!(
@@ -312,7 +373,7 @@ async fn build_ctx_from_template(
                          grant raw TCP or UDP"
                     );
                 }
-                permitted
+                decision
             })
         }),
         loopback: Arc::clone(&template.loopback),
@@ -481,14 +542,14 @@ fn resolve_memory_budget_bytes(
         return Ok(None);
     };
 
-    if let Some(ceiling_mb) = host_ceiling.and_then(|value| value.parse::<u64>().ok()) {
-        if budget_mb > ceiling_mb {
-            anyhow::bail!(
-                "component '{component_id}': wamn memory budget {budget_mb} MiB exceeds the host \
-                 ceiling {ceiling_mb} MiB (pooling max_memory_size); lower the budget or raise \
-                 the ceiling"
-            );
-        }
+    if let Some(ceiling_mb) = host_ceiling.and_then(|value| value.parse::<u64>().ok())
+        && budget_mb > ceiling_mb
+    {
+        anyhow::bail!(
+            "component '{component_id}': wamn memory budget {budget_mb} MiB exceeds the host \
+             ceiling {ceiling_mb} MiB (pooling max_memory_size); lower the budget or raise \
+             the ceiling"
+        );
     }
 
     let budget_bytes = usize::try_from(budget_mb)
@@ -821,53 +882,18 @@ async fn invoke_ephemeral_relocated(
 
 /// Run a plain-value async linked call.
 ///
-/// The store is short-lived by default: built, invoked, and dropped per call
-/// so its core-instance slots are reclaimed immediately. A component that has
-/// opted into warm instances (`pool_size > 0`) instead reuses one parked by an
-/// earlier call and, if the call returns cleanly, parks it again — skipping
-/// the context build, the store allocation and the instantiation, and letting
-/// the guest keep whatever it cached in linear memory. See
-/// [`InstancePool`] for the rules that bound how long an instance lives.
+/// A component that keeps instances warm serves this on one of them, alongside
+/// whatever else that instance already has in flight (see
+/// [`crate::engine::instance_driver`]). Otherwise — and when every warm
+/// instance is busy and the pool is full — the call runs in a store built,
+/// invoked and dropped for it alone, so its core-instance slots are reclaimed
+/// immediately.
 async fn invoke_ephemeral_plain(
     params: &[Val],
     results: &mut [Val],
     inv: &LinkedExportInvocation,
     ephemeral_call: &EphemeralLinkedCall,
 ) -> wasmtime::Result<()> {
-    let pool = callee_instance_pool(ephemeral_call).await;
-
-    // A warm instance if one is parked, otherwise a cold store. A burst past
-    // `pool_size` is served cold rather than queued, so pooling never adds
-    // latency it did not save.
-    let warm = match pool.as_ref().and_then(|pool| pool.checkout()) {
-        Some(warm) => {
-            trace!(
-                name = %inv.import_name,
-                fn_name = %inv.export_name,
-                invocations = warm.invocations,
-                "reusing warm instance for ephemeral dynamic export"
-            );
-            warm
-        }
-        None => {
-            let mut store = new_ephemeral_store(ephemeral_call)
-                .await
-                .map_err(|e| wasmtime::format_err!("{e:#}"))?;
-            let instance = inv.pre.instantiate_async(&mut store).await?;
-            ComponentInstance {
-                store,
-                instance,
-                invocations: 0,
-            }
-        }
-    };
-
-    let params_buf = params.to_vec();
-    let mut results_buf = vec![Val::Bool(false); results.len()];
-    let call_import_name = inv.import_name.clone();
-    let call_export_name = inv.export_name.clone();
-    let func_idx = inv.func_idx;
-
     trace!(
         name = %inv.import_name,
         fn_name = %inv.export_name,
@@ -875,16 +901,81 @@ async fn invoke_ephemeral_plain(
         "invoking ephemeral dynamic export"
     );
 
-    // The store travels into the task and back out with the result, so a
-    // caller cancelled mid-call (the `AbortOnDrop`) drops the store with the
-    // task instead of returning a half-finished instance to the pool.
+    let pool = callee_instance_pool(ephemeral_call).await;
+
+    // The params travel into the pooled job. A job the pool declines hands
+    // them back, so the cold path below reuses that allocation rather than
+    // cloning them a second time.
+    let mut declined_params = None;
+
+    if let Some(pool) = pool.as_ref() {
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        let job = InstanceJob::Linked(Box::new(LinkedJob {
+            func_idx: inv.func_idx,
+            params: params.to_vec(),
+            results_len: results.len(),
+            import_name: inv.import_name.clone(),
+            export_name: inv.export_name.clone(),
+            reply,
+        }));
+        let outcome = match pool.offer(job) {
+            Dispatch::Sent => Ok(()),
+            // The pool has room. Build and instantiate the store out here,
+            // where awaiting is allowed and where a component that fails to
+            // instantiate reports that failure to this call rather than only
+            // to the log.
+            Dispatch::NeedsInstance(job) => {
+                let mut store = new_ephemeral_store(ephemeral_call).await.map_err(|e| {
+                    wasmtime::format_err!("new pooled store creation failed: {e:#}")
+                })?;
+                let instance = inv.pre.instantiate_async(&mut store).await?;
+                pool.install(ComponentInstance { store, instance }, job)
+            }
+            Dispatch::Saturated(job) => Err(job),
+        };
+        match outcome {
+            Ok(()) => {
+                let vals = reply_rx
+                    .await
+                    .map_err(|_| wasmtime::format_err!("pooled instance dropped the call"))??;
+                write_results(vals, results)?;
+                trace!(
+                    name = %inv.import_name,
+                    fn_name = %inv.export_name,
+                    ?results,
+                    "invoked ephemeral dynamic export"
+                );
+                return Ok(());
+            }
+            // Every warm instance was busy; run it in a store of its own.
+            Err(declined) => {
+                debug!(
+                    name = %inv.import_name,
+                    fn_name = %inv.export_name,
+                    "warm instances saturated; serving this call from a store of its own"
+                );
+                if let InstanceJob::Linked(job) = declined {
+                    declined_params = Some(job.params);
+                }
+            }
+        }
+    }
+
+    let mut store = new_ephemeral_store(ephemeral_call)
+        .await
+        .map_err(|e| wasmtime::format_err!("new ephemeral store creation failed: {e:#}"))?;
+    let instance = inv.pre.instantiate_async(&mut store).await?;
+
+    let params_buf = declined_params.unwrap_or_else(|| params.to_vec());
+    let mut results_buf = vec![Val::Bool(false); results.len()];
+    let call_import_name = inv.import_name.clone();
+    let call_export_name = inv.export_name.clone();
+    let func_idx = inv.func_idx;
+
+    // The store travels into the task, so a caller cancelled mid-call drops it
+    // with the task rather than leaving it running.
     let mut task = AbortOnDrop(tokio::task::spawn(async move {
-        let ComponentInstance {
-            mut store,
-            instance,
-            invocations,
-        } = warm;
-        let outcome = store
+        store
             .run_concurrent(async move |accessor| {
                 let func = accessor.with(|mut access| -> wasmtime::Result<_> {
                     instance.get_func(&mut access, func_idx).with_context(|| {
@@ -906,43 +997,12 @@ async fn invoke_ephemeral_plain(
             })
             .await
             .map_err(|e| wasmtime::format_err!("{e:#}"))
-            .and_then(|inner| inner);
-        (
-            ComponentInstance {
-                store,
-                instance,
-                invocations,
-            },
-            outcome,
-        )
+            .and_then(|inner| inner)
     }));
-    let (warm, outcome) = (&mut task.0)
+    let vals = (&mut task.0)
         .await
-        .map_err(|e| wasmtime::format_err!("ephemeral linked call task failed: {e}"))?;
-
-    // Park only after a clean return. A trap, a timeout or a host error may
-    // have left the guest mid-operation, so those retire the instance — the
-    // next call then starts from a cold store. Anything not parked is dropped
-    // here rather than at the end of the call, so an unpooled component still
-    // reclaims its core-instance slots the moment the call returns.
-    let call_result = match (outcome, pool) {
-        (Ok(vals), Some(pool)) => {
-            pool.release(warm);
-            vals
-        }
-        (Ok(vals), None) => {
-            drop(warm);
-            vals
-        }
-        (Err(e), _) => {
-            drop(warm);
-            return Err(e);
-        }
-    };
-
-    for (i, v) in call_result.into_iter().enumerate() {
-        *results.get_mut(i).context("result index out of bounds")? = v;
-    }
+        .map_err(|e| wasmtime::format_err!("ephemeral linked call task failed: {e}"))??;
+    write_results(vals, results)?;
 
     trace!(
         name = %inv.import_name,
@@ -951,6 +1011,14 @@ async fn invoke_ephemeral_plain(
         "invoked ephemeral dynamic export"
     );
 
+    Ok(())
+}
+
+/// Copy a call's returned values into the caller's result slots.
+fn write_results(vals: Vec<Val>, results: &mut [Val]) -> wasmtime::Result<()> {
+    for (i, v) in vals.into_iter().enumerate() {
+        *results.get_mut(i).context("result index out of bounds")? = v;
+    }
     Ok(())
 }
 
@@ -1261,120 +1329,82 @@ mod tests {
         assert!(resolve_allow_raw_sockets(None, Some("true")));
     }
 
-    #[test]
-    fn tcp_connect_denied_without_raw_socket_opt_in() {
-        assert!(!socket_addr_permitted(
-            SocketAddrUse::TcpConnect,
-            false,
-            false,
-            false,
-            false,
-        ));
-        assert!(!socket_addr_permitted(
-            SocketAddrUse::TcpConnect,
-            true,
-            false,
-            false,
-            false,
-        ));
+    fn remote_addr() -> std::net::SocketAddr {
+        std::net::SocketAddr::from(([192, 0, 2, 1], 443))
+    }
+
+    /// A policy as permissive as upstream ships it: default `Count` egress
+    /// mode plus an allow-everything host entry. Shaping must close both.
+    fn permissive_policy() -> sockets::policy::SocketPolicy {
+        sockets::policy::SocketPolicy {
+            allowed_hosts: Arc::from([
+                "*".parse::<crate::host::allowed_hosts::AllowedHost>()
+                    .expect("allow-all host entry should parse"),
+            ]),
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn tcp_connect_allowed_with_raw_socket_opt_in() {
-        assert!(socket_addr_permitted(
+    fn shaping_denies_raw_egress_without_opt_in() {
+        // Neither the host's count-mode default nor an allow-all
+        // `allowedHosts` entry may grant raw egress without the opt-in.
+        let shaped = shape_socket_policy(permissive_policy(), false);
+        for reason in [
             SocketAddrUse::TcpConnect,
-            false,
-            false,
-            false,
-            true,
-        ));
-    }
-
-    #[test]
-    fn udp_connect_denied_without_raw_socket_opt_in() {
-        assert!(!socket_addr_permitted(
             SocketAddrUse::UdpConnect,
-            false,
-            false,
-            false,
-            false,
-        ));
-    }
-
-    #[test]
-    fn udp_connect_allowed_with_raw_socket_opt_in() {
-        assert!(socket_addr_permitted(
-            SocketAddrUse::UdpConnect,
-            false,
-            false,
-            false,
-            true,
-        ));
-    }
-
-    #[test]
-    fn udp_outgoing_datagram_denied_without_raw_socket_opt_in() {
-        assert!(!socket_addr_permitted(
             SocketAddrUse::UdpOutgoingDatagram,
-            false,
-            false,
-            false,
-            false,
-        ));
+        ] {
+            assert!(
+                matches!(
+                    shaped.decide(reason, remote_addr()),
+                    sockets::AddrDecision::Deny(sockets::DenyReason::NotPermitted)
+                ),
+                "{reason:?} must be denied without the raw-sockets opt-in"
+            );
+        }
     }
 
     #[test]
-    fn udp_outgoing_datagram_allowed_with_raw_socket_opt_in() {
-        assert!(socket_addr_permitted(
-            SocketAddrUse::UdpOutgoingDatagram,
-            false,
-            false,
-            false,
-            true,
-        ));
+    fn shaping_leaves_virtual_loopback_and_egress_binds() {
+        let shaped = shape_socket_policy(permissive_policy(), false);
+        let loopback_connect = shaped.decide(
+            SocketAddrUse::TcpConnect,
+            std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
+        );
+        assert!(
+            matches!(
+                loopback_connect,
+                sockets::AddrDecision::Allow(sockets::Allowed {
+                    plane: sockets::Plane::Virtual,
+                    ..
+                })
+            ),
+            "in-process virtual loopback is not raw egress and stays open"
+        );
+        for reason in [SocketAddrUse::UdpBind, SocketAddrUse::UdpImplicitBind] {
+            assert!(
+                matches!(
+                    shaped.decide(reason, std::net::SocketAddr::from(([0, 0, 0, 0], 0))),
+                    sockets::AddrDecision::Allow(_)
+                ),
+                "a local UDP egress bind ({reason:?}) is not itself egress; the \
+                 datagram's destination is denied separately"
+            );
+        }
     }
 
     #[test]
-    fn udp_bind_allows_only_service_loopback() {
-        assert!(socket_addr_permitted(
-            SocketAddrUse::UdpBind,
-            true,
-            false,
-            true,
-            false,
-        ));
-        assert!(!socket_addr_permitted(
-            SocketAddrUse::UdpBind,
-            false,
-            true,
-            true,
-            false,
-        ));
-        assert!(!socket_addr_permitted(
-            SocketAddrUse::UdpBind,
-            true,
-            false,
-            false,
-            false,
-        ));
-    }
-
-    #[test]
-    fn raw_socket_opt_in_does_not_widen_udp_bind() {
-        assert!(!socket_addr_permitted(
-            SocketAddrUse::UdpBind,
-            false,
-            true,
-            true,
-            true,
-        ));
-        assert!(!socket_addr_permitted(
-            SocketAddrUse::UdpBind,
-            true,
-            false,
-            false,
-            true,
-        ));
+    fn opt_in_returns_the_policy_unshaped() {
+        let shaped = shape_socket_policy(permissive_policy(), true);
+        assert!(
+            matches!(
+                shaped.decide(SocketAddrUse::TcpConnect, remote_addr()),
+                sockets::AddrDecision::Allow(_)
+            ),
+            "the opt-in must restore upstream's host-configured behavior"
+        );
+        assert_eq!(shaped.egress_mode, sockets::policy::EgressMode::Count);
     }
 
     #[test]
@@ -1384,6 +1414,7 @@ mod tests {
         assert!(is_raw_egress(SocketAddrUse::UdpOutgoingDatagram));
         assert!(!is_raw_egress(SocketAddrUse::TcpBind));
         assert!(!is_raw_egress(SocketAddrUse::UdpBind));
+        assert!(!is_raw_egress(SocketAddrUse::UdpImplicitBind));
     }
 
     #[tokio::test]
@@ -1406,6 +1437,7 @@ mod tests {
             volume_mounts: Vec::new(),
             plugins: None,
             loopback: Arc::new(std::sync::Mutex::new(loopback::Network::default())),
+            socket_policy: Arc::new(sockets::policy::SocketPolicy::default()),
             #[cfg(feature = "wasi-tls")]
             tls_provider: None,
         };
@@ -1434,22 +1466,26 @@ mod tests {
                 std::net::SocketAddr::from(([192, 0, 2, 1], 53)),
                 SocketAddrUse::UdpOutgoingDatagram,
             ),
-            (
-                std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-                SocketAddrUse::UdpBind,
-            ),
         ] {
-            let error = ctx
-                .sockets
-                .socket_addr_check
-                .check(addr, reason)
-                .await
-                .expect_err("lookup policy must not grant raw UDP or component UDP bind");
-            assert_eq!(
-                error.kind(),
-                std::io::ErrorKind::PermissionDenied,
-                "allow-all lookup policy unexpectedly granted {reason:?}",
+            let Err(error) = ctx.sockets.socket_addr_check.check(addr, reason).await else {
+                panic!("allow-all lookup policy must not grant raw UDP egress ({reason:?})");
+            };
+            assert!(
+                matches!(error, crate::sockets::util::ErrorCode::AccessDenied),
+                "raw UDP egress must be refused as access-denied, got {error:?} for {reason:?}",
             );
         }
+
+        // A local UDP bind is the required first step of egress, not egress
+        // itself, and the destination is denied above — so the bind stays
+        // permitted for components under the upstream policy.
+        ctx.sockets
+            .socket_addr_check
+            .check(
+                std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+                SocketAddrUse::UdpBind,
+            )
+            .await
+            .expect("a component's local UDP bind should stay permitted");
     }
 }

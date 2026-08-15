@@ -89,6 +89,7 @@ const P2_FIXTURES: &[&str] = &[
     "inter-component-call-callee",
     "inter-component-call-middleware",
     "http-allowed-hosts",
+    "http-egress-pool",
     "http-ip-name-lookup",
     "keyvalue-counter",
     "keyvalue-implements",
@@ -122,6 +123,7 @@ const P3_FIXTURES: &[&str] = &[
     "svc-tcp-echo",
     "http-loopback-gateway",
     "svc-no-run",
+    "http-sleeper",
     "msg-counter",
     "bridge-backend",
     "bridge-service",
@@ -130,8 +132,13 @@ const P3_FIXTURES: &[&str] = &[
     "kv-plugin-caller",
     "kv-plugin-service",
     "badlifecycle",
-    "secrets-host",
     "secrets-caller",
+    "secrets-consumer-plugin",
+    "secrets-consumer-plugin-caller",
+    "http-egress-plugin",
+    "http-egress-plugin-caller",
+    "events-plugin",
+    "events-caller",
 ];
 
 fn build_fixtures(workspace: &Path) -> Result<()> {

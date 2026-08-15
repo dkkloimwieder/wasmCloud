@@ -12,12 +12,13 @@ rust-version.workspace = true
 version.workspace = true
 
 [features]
-default = ["wasi-webgpu"]
+default = ["wasi-webgpu", "wasm_component_model_implements"]
 wasi-tls = ["wash-runtime/wasi-tls"]
 # Route component-model `(implements ..)` named imports to per-import backends.
-# When enabled, `wash host`/`wash dev` additionally register the multiplexed
-# keyvalue plugin (the unnamed/default import keeps its standalone backend, so
-# normal workloads are unaffected). Needs a wasmtime build with resource-implements.
+# On by default: `wash host`/`wash dev` register the multiplexed keyvalue plugin
+# (the unnamed/default import keeps its standalone backend, so normal workloads
+# are unaffected). Disable with `--no-default-features` for a build that rejects
+# components importing an interface more than once.
 wasm_component_model_implements = ["wash-runtime/wasm_component_model_implements"]
 # Host component plugins: host capabilities provided by wasm components running
 # in their own supervised stores (wash-runtime's `plugin::component_host`).
@@ -74,12 +75,6 @@ wasm-pkg-client = { workspace = true }
 wasm-pkg-core = { workspace = true }
 wash-runtime = { workspace = true, features = ["washlet", "oci", "wasi-config", "wasi-logging", "wasi-blobstore", "wasi-keyvalue", "wasmcloud-postgres", "wasi-otel"] }
 wit-component = { workspace = true }
-
-# `O_NOFOLLOW` for the secret-file-open hardening in `crate::workload`.
-# Unix-only. Windows has no portable equivalent.
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
 
 [build-dependencies]
 anyhow = { workspace = true, default-features = true }

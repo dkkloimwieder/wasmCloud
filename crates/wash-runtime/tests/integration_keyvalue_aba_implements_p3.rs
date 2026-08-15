@@ -53,7 +53,7 @@ fn kv_store_iface(name: &str) -> WitInterface {
         namespace: "wasmcloud".to_string(),
         package: "keyvalue".to_string(),
         interfaces: ["store".to_string()].into_iter().collect(),
-        version: Some(semver::Version::parse("0.1.0").unwrap()),
+        version: Some(semver::Version::parse("0.2.0").unwrap()),
         config: HashMap::from([("backend".to_string(), "in-memory".to_string())]),
         name: Some(name.to_string()),
     }
@@ -92,6 +92,7 @@ async fn p3_guest_cas_swap_detects_aba() -> Result<()> {
                 local_resources: LocalResources::default(),
                 pool_size: 1,
                 max_invocations: 100,
+                max_concurrency: 1,
             }],
             host_interfaces,
             volumes: vec![],

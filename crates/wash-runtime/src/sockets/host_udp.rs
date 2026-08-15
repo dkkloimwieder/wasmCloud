@@ -59,17 +59,23 @@ fn rebind_outgoing_own(
     Resource::<OutgoingDatagramStream>::new_own(this.rep())
 }
 
+/// Consult the socket policy for an unconnected `send-to` destination.
+///
+/// Returns the policy's [`Allowed`](super::Allowed) verdict rather than `()`:
+/// the address may have been rewritten (an internal-zone sentinel resolves
+/// here) and the plane it chose must be honored, so the caller sends to what
+/// this returns.
 async fn check_unconnected_datagram_address(
     socket_addr_check: Option<&super::SocketAddrCheck>,
     addr: SocketAddr,
-) -> SocketResult<()> {
+) -> SocketResult<super::Allowed> {
     let Some(check) = socket_addr_check else {
         return Err(ErrorCode::InvalidState.into());
     };
     check
         .check(addr, SocketAddrUse::UdpOutgoingDatagram)
         .await
-        .map_err(super::network::socket_error_from_io)
+        .map_err(super::network::socket_error_from_util)
 }
 
 impl udp::Host for WasiSocketsCtxView<'_> {}
@@ -85,10 +91,11 @@ impl udp::HostUdpSocket for WasiSocketsCtxView<'_> {
         let network = rebind_network_borrow(&network);
         let local_address = ip_socket_address_to_socket_addr(local_address);
         let check = self.table.get(&network)?.socket_addr_check.clone();
-        check
+        let allowed = check
             .check(local_address, SocketAddrUse::UdpBind)
             .await
-            .map_err(super::network::socket_error_from_io)?;
+            .map_err(super::network::socket_error_from_util)?;
+        let local_address = allowed.addr;
 
         let socket = self.table.get_mut(&this)?;
 
@@ -136,28 +143,37 @@ impl udp::HostUdpSocket for WasiSocketsCtxView<'_> {
         }
 
         let socket = self.table.get_mut(&this)?;
-        let remote_address = remote_address.map(ip_socket_address_to_socket_addr);
+        // Reassigned below if the policy rewrote it, so the streams built at the
+        // end address what was actually connected rather than what was asked for.
+        let mut remote_address = remote_address.map(ip_socket_address_to_socket_addr);
 
         if !socket.is_bound() {
             return Err(ErrorCode::InvalidState.into());
         }
 
+        let mut connect_plane = None;
         if let Some(connect_addr) = remote_address {
             let Some(check) = socket.socket_addr_check() else {
                 return Err(ErrorCode::InvalidState.into());
             };
-            check
+            let allowed = check
                 .check(connect_addr, SocketAddrUse::UdpConnect)
                 .await
-                .map_err(super::network::socket_error_from_io)?;
+                .map_err(super::network::socket_error_from_util)?;
+            connect_plane = Some(allowed.plane);
+            let connect_addr = allowed.addr;
+            remote_address = Some(connect_addr);
             let mut loopback = self
                 .ctx
                 .loopback
                 .lock()
                 .map_err(|e| SocketError::trap(wasmtime::format_err!("{e}")))?;
             socket
-                .connect(connect_addr, &mut loopback)
+                .connect(connect_addr, allowed.plane, &mut loopback)
                 .map_err(super::network::socket_error_from_util)?;
+            // Held for the socket's life: one descriptor, however many
+            // datagrams it goes on to send.
+            socket.hold_quota_slot(allowed.permit);
         } else if socket.is_connected() {
             let mut loopback = self
                 .ctx
@@ -168,7 +184,12 @@ impl udp::HostUdpSocket for WasiSocketsCtxView<'_> {
                 .disconnect(&mut loopback)
                 .map_err(super::network::socket_error_from_util)?;
         }
-        let is_loopback = remote_address.map(|addr| addr.ip().to_canonical().is_loopback());
+        // Which network carries this socket's datagrams: the policy's answer for
+        // the peer it connected to, or — for an unconnected socket — the address
+        // it was bound on.
+        let is_loopback = connect_plane
+            .map(|plane| plane == crate::sockets::Plane::Virtual)
+            .or_else(|| remote_address.map(|addr| addr.ip().to_canonical().is_loopback()));
 
         let (incoming_stream, outgoing_stream) = match (socket, is_loopback) {
             (UdpSocket::Network(socket), ..)
@@ -176,6 +197,7 @@ impl udp::HostUdpSocket for WasiSocketsCtxView<'_> {
                 IncomingDatagramStream::Network(super::p2_udp::NetworkIncomingDatagramStream {
                     inner: socket.socket().clone(),
                     remote_address,
+                    egress_peers: socket.egress_peers(),
                 }),
                 OutgoingDatagramStream::Network(super::p2_udp::NetworkOutgoingDatagramStream {
                     inner: socket.socket().clone(),
@@ -183,6 +205,7 @@ impl udp::HostUdpSocket for WasiSocketsCtxView<'_> {
                     family: socket.address_family(),
                     check_send_permit_count: 0,
                     socket_addr_check: socket.socket_addr_check().cloned(),
+                    egress_peers: socket.egress_peers(),
                 }),
             ),
             (UdpSocket::Loopback(socket), ..)
@@ -205,6 +228,7 @@ impl udp::HostUdpSocket for WasiSocketsCtxView<'_> {
                         net: super::p2_udp::NetworkIncomingDatagramStream {
                             inner: net.socket().clone(),
                             remote_address,
+                            egress_peers: net.egress_peers(),
                         },
                     },
                     OutgoingDatagramStream::Unspecified {
@@ -215,6 +239,7 @@ impl udp::HostUdpSocket for WasiSocketsCtxView<'_> {
                             family: net.address_family(),
                             check_send_permit_count: 0,
                             socket_addr_check: net.socket_addr_check().cloned(),
+                            egress_peers: net.egress_peers(),
                         },
                     },
                 )
@@ -378,6 +403,18 @@ impl udp::HostIncomingDatagramStream for WasiSocketsCtxView<'_> {
                 _ => {}
             }
 
+            // An unspecified-bound socket is reachable on every interface, so
+            // it hears from anyone. Deliver only what answers something the
+            // guest sent: a reply is what makes it a client, and anything else
+            // would make it an unsolicited server on a real interface.
+            if let Some(peers) = stream.egress_peers.as_ref()
+                && !peers
+                    .lock()
+                    .is_ok_and(|peers| peers.contains(&received_addr))
+            {
+                return Ok(None);
+            }
+
             Ok(Some(udp::IncomingDatagram {
                 data: buf.get(..size).unwrap_or_default().into(),
                 remote_address: socket_addr_to_ip_socket_address(received_addr),
@@ -525,12 +562,19 @@ impl udp::HostOutgoingDatagramStream for WasiSocketsCtxView<'_> {
     ) -> SocketResult<u64> {
         let this = rebind_outgoing_borrow(&this);
 
+        /// Resolve one datagram's destination, returning the address to use and
+        /// — when the policy was consulted — the plane it put that address on.
+        ///
+        /// The address may differ from the one the guest supplied: an
+        /// internal-zone sentinel resolves here, so the caller must send to
+        /// what this returns. `None` for the plane means the socket is
+        /// connected and the decision was made at connect time.
         async fn prepare_one(
             remote_address: Option<SocketAddr>,
             family: SocketAddressFamily,
             socket_addr_check: Option<&super::SocketAddrCheck>,
             datagram: &udp::OutgoingDatagram,
-        ) -> SocketResult<SocketAddr> {
+        ) -> SocketResult<(SocketAddr, Option<super::Plane>)> {
             if datagram.data.len() > MAX_UDP_DATAGRAM_SIZE {
                 return Err(ErrorCode::DatagramTooLarge.into());
             }
@@ -538,14 +582,15 @@ impl udp::HostOutgoingDatagramStream for WasiSocketsCtxView<'_> {
             let provided_addr = datagram
                 .remote_address
                 .map(ip_socket_address_to_socket_addr);
-            let addr = match (remote_address, provided_addr) {
+            let (addr, plane) = match (remote_address, provided_addr) {
                 (None, Some(addr)) => {
-                    check_unconnected_datagram_address(socket_addr_check, addr).await?;
-                    addr
+                    let allowed =
+                        check_unconnected_datagram_address(socket_addr_check, addr).await?;
+                    (allowed.addr, Some(allowed.plane))
                 }
-                (Some(addr), None) => addr,
+                (Some(addr), None) => (addr, None),
                 (Some(connected_addr), Some(provided_addr)) if connected_addr == provided_addr => {
-                    connected_addr
+                    (connected_addr, None)
                 }
                 _ => return Err(ErrorCode::InvalidArgument.into()),
             };
@@ -553,7 +598,7 @@ impl udp::HostOutgoingDatagramStream for WasiSocketsCtxView<'_> {
             if !is_valid_remote_address(addr) || !is_valid_address_family(addr.ip(), family) {
                 return Err(ErrorCode::InvalidArgument.into());
             }
-            Ok(addr)
+            Ok((addr, plane))
         }
 
         fn send_one_net(
@@ -561,6 +606,13 @@ impl udp::HostOutgoingDatagramStream for WasiSocketsCtxView<'_> {
             datagram: &udp::OutgoingDatagram,
             addr: SocketAddr,
         ) -> SocketResult<()> {
+            // Remember the peer before sending, so its reply is admitted by
+            // the receive path even if it beats us back.
+            if let Some(peers) = stream.egress_peers.as_ref()
+                && let Ok(mut peers) = peers.lock()
+            {
+                peers.insert(addr);
+            }
             if stream.remote_address == Some(addr) {
                 stream
                     .inner
@@ -581,7 +633,7 @@ impl udp::HostOutgoingDatagramStream for WasiSocketsCtxView<'_> {
             datagram: udp::OutgoingDatagram,
             loopback: &std::sync::Mutex<super::loopback::Network>,
         ) -> SocketResult<()> {
-            let addr = prepare_one(
+            let (addr, _plane) = prepare_one(
                 stream.remote_address,
                 stream.family,
                 stream.socket_addr_check.as_ref(),
@@ -664,7 +716,7 @@ impl udp::HostOutgoingDatagramStream for WasiSocketsCtxView<'_> {
         let mut count = 0;
 
         for datagram in datagrams {
-            let addr = prepare_one(
+            let (addr, plane) = prepare_one(
                 stream.remote_address,
                 stream.family,
                 stream.socket_addr_check.as_ref(),
@@ -672,9 +724,16 @@ impl udp::HostOutgoingDatagramStream for WasiSocketsCtxView<'_> {
             )
             .await?;
 
-            if addr.ip().to_canonical().is_loopback()
-                && let Some(stream) = lo.as_mut()
-            {
+            // The policy says which network carries this datagram. The address
+            // cannot: a sentinel resolved to the machine's own loopback looks
+            // exactly like the guest's virtual loopback by then, so dispatching
+            // on `is_loopback` would send host-plane traffic into the virtual
+            // network, where it is dropped in silence.
+            let virtual_plane = match plane {
+                Some(plane) => plane == crate::sockets::Plane::Virtual,
+                None => addr.ip().to_canonical().is_loopback(),
+            };
+            if virtual_plane && let Some(stream) = lo.as_mut() {
                 send_one_lo(stream, datagram, &self.ctx.loopback).await?;
                 count += 1;
                 continue;
@@ -754,11 +813,11 @@ impl From<SocketAddressFamily> for IpAddressFamily {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sockets::SocketAddrCheck;
+    use crate::sockets::{AddrDecision, DenyReason, SocketAddrCheck};
     use std::sync::{Arc, Mutex};
 
     fn recording_check(permitted: bool, seen: Arc<Mutex<Vec<&'static str>>>) -> SocketAddrCheck {
-        SocketAddrCheck::new(move |_, reason| {
+        SocketAddrCheck::new(move |addr, reason| {
             let seen = Arc::clone(&seen);
             Box::pin(async move {
                 let name = match reason {
@@ -768,7 +827,11 @@ mod tests {
                 seen.lock()
                     .expect("recording mutex should not be poisoned")
                     .push(name);
-                permitted
+                if permitted {
+                    AddrDecision::allow_by_address(addr)
+                } else {
+                    AddrDecision::Deny(DenyReason::NotPermitted)
+                }
             })
         })
     }
@@ -777,14 +840,13 @@ mod tests {
     async fn p2_unconnected_send_checks_outgoing_datagram_address() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let check = recording_check(true, Arc::clone(&seen));
+        let addr = SocketAddr::from(([192, 0, 2, 1], 53));
 
-        let result = check_unconnected_datagram_address(
-            Some(&check),
-            SocketAddr::from(([192, 0, 2, 1], 53)),
-        )
-        .await;
+        let allowed = check_unconnected_datagram_address(Some(&check), addr)
+            .await
+            .expect("permitted datagram address should pass the policy");
 
-        assert!(result.is_ok());
+        assert_eq!(allowed.addr, addr);
         assert_eq!(
             *seen.lock().expect("recording mutex should not be poisoned"),
             ["outgoing-datagram"]
