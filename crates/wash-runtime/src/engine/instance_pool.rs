@@ -114,6 +114,33 @@ pub(crate) struct ComponentInstance {
     pub(crate) instance: Instance,
 }
 
+/// The wamn per-run isolation kill-switch: `WAMN_DISABLE_INSTANCE_POOLING=true`
+/// forces every component to [`InstancePolicy::Ephemeral`], whatever
+/// `pool_size` its manifest asks for.
+///
+/// A warm instance keeps one store — and its linear memory — alive across
+/// calls, so a workload could opt itself into state that survives a run. On a
+/// host whose workloads assume per-run isolation as a floor (wamn's
+/// flowrunner), this flag turns that assumption from a manifest convention
+/// into a host-enforced invariant. Deliberately env-only, no per-workload
+/// config: the point is that a manifest cannot override it.
+fn wamn_instance_pooling_disabled() -> bool {
+    let Ok(value) = std::env::var("WAMN_DISABLE_INSTANCE_POOLING") else {
+        return false;
+    };
+    // A hardening flag fails closed: a value that is set but unparseable
+    // disables pooling rather than silently allowing it.
+    value.parse::<bool>().unwrap_or_else(|_| {
+        tracing::warn!(
+            target: "wamn::instances",
+            value = %value,
+            "WAMN_DISABLE_INSTANCE_POOLING is set to an unparseable value; treating it as \
+             true (pooling disabled) — use 'true' or 'false'"
+        );
+        true
+    })
+}
+
 /// What a component asked for by way of instance reuse.
 ///
 /// The limits arrive as `sint32`, signed all the way from the Kubernetes CRD
@@ -166,8 +193,36 @@ impl InstancePolicy {
     /// size, whether unset (`-1`), zero or negative, means instances are not
     /// kept; an unset `max_concurrency` means one call at a time.
     pub(crate) fn from_limits(pool_size: i32, max_invocations: i32, max_concurrency: i32) -> Self {
+        Self::from_limits_gated(
+            pool_size,
+            max_invocations,
+            max_concurrency,
+            wamn_instance_pooling_disabled(),
+        )
+    }
+
+    /// [`Self::from_limits`] with the wamn kill-switch made explicit, so tests
+    /// can pin the clamp without mutating process environment.
+    pub(crate) fn from_limits_gated(
+        pool_size: i32,
+        max_invocations: i32,
+        max_concurrency: i32,
+        pooling_disabled: bool,
+    ) -> Self {
         let positive = |v: i32| usize::try_from(v).ok().and_then(NonZeroUsize::new);
         match positive(pool_size) {
+            // Clamped, not rejected: refusing the workload would turn a host
+            // hardening flag into a deploy outage, while an ephemeral store
+            // per call is always a correct (if slower) way to serve it.
+            Some(pool_size) if pooling_disabled => {
+                tracing::warn!(
+                    target: "wamn::instances",
+                    pool_size = pool_size.get(),
+                    "ignoring pool_size: WAMN_DISABLE_INSTANCE_POOLING is set, so every call \
+                     gets a fresh store (per-run isolation); unset it to allow warm instances"
+                );
+                Self::Ephemeral
+            }
             Some(pool_size) => Self::Warm {
                 pool_size,
                 max_invocations: positive(max_invocations),
@@ -374,5 +429,18 @@ mod tests {
                 max_concurrency: NonZeroUsize::MIN,
             }
         );
+    }
+
+    /// The wamn kill-switch clamps any requested pool to ephemeral, so a
+    /// manifest cannot opt a host that requires per-run isolation into
+    /// call-surviving instance state; without the switch the same limits keep
+    /// instances warm.
+    #[test]
+    fn the_pooling_kill_switch_forces_ephemeral() {
+        assert_eq!(
+            InstancePolicy::from_limits_gated(4, 100, 8, true),
+            InstancePolicy::Ephemeral,
+        );
+        assert!(InstancePolicy::from_limits_gated(4, 100, 8, false).keeps_instances_warm());
     }
 }
