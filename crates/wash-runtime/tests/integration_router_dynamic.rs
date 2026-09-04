@@ -18,7 +18,7 @@
 //! - Invalid hostnames in host-aliases are silently filtered; only valid ones route.
 //! - Two workloads bound to the same host both serve requests (HashSet routing).
 //! - Stopping a workload removes all of its routes — primary host and every
-//!   alias — so requests to any former alias return 404 after unbind.
+//!   alias — so requests to any former alias return 503 after unbind.
 
 use anyhow::{Context, Result};
 use futures::future::join_all;
@@ -260,7 +260,7 @@ async fn test_missing_host_returns_400() -> Result<()> {
 /// Invalid hostnames in `host-aliases` (e.g. names containing spaces) must be
 /// silently filtered by `DynamicRouter::on_workload_resolved`. The valid alias
 /// must still route; the invalid one must not appear in the routing table and
-/// must therefore return 404.
+/// must therefore return 503.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_invalid_alias_is_silently_filtered() -> Result<()> {
     let (addr, host) = start_host_with_dynamic_router("127.0.0.1:0").await?;
@@ -277,12 +277,12 @@ async fn test_invalid_alias_is_silently_filtered() -> Result<()> {
         "primary host should route successfully"
     );
 
-    // "not a hostname" must not have been registered and must return 404.
+    // "not a hostname" must not have been registered and must be unroutable.
     let invalid_status = get_status(&client, addr, "not a hostname").await?;
     assert_eq!(
         invalid_status,
-        reqwest::StatusCode::NOT_FOUND,
-        "invalid alias must be filtered and return 404, got {invalid_status}"
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "invalid alias must be filtered and return 503, got {invalid_status}"
     );
 
     Ok(())
@@ -329,10 +329,12 @@ async fn test_multiple_workloads_same_host_both_serve() -> Result<()> {
     Ok(())
 }
 
-/// Requests targeting a host that no workload is bound to must return 404
-/// (`RouteError::NoWorkloadForHost`)
+/// Requests targeting a host that no workload is bound to must return 503 with
+/// `Retry-After` (`RouteError::NoWorkloadForHost`). A host is unbound both while
+/// a workload is being rebound and when it was never bound, and this layer
+/// cannot tell those apart, so it answers the retryable one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_dynamic_router_unknown_host_returns_404() -> Result<()> {
+async fn test_dynamic_router_unknown_host_returns_503_retryable() -> Result<()> {
     let (addr, host) = start_host_with_dynamic_router("127.0.0.1:0").await?;
     host.workload_start(http_counter_request("known.local", None))
         .await?;
@@ -346,12 +348,25 @@ async fn test_dynamic_router_unknown_host_returns_404() -> Result<()> {
         "bound host should succeed; got {status} with body {body:?}"
     );
 
-    // An unbound host will return 404
-    let status = get_status(&client, addr, "nope.local").await?;
+    // An unbound host is retryable, not a verdict.
+    let response = client
+        .get(format!("http://{addr}/"))
+        .header("Host", "nope.local")
+        .send()
+        .await?;
+    let status = response.status();
     assert_eq!(
         status,
-        reqwest::StatusCode::NOT_FOUND,
-        "unknown host must map to RouteError::NoWorkloadForHost -> 404, got {status}"
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "unknown host must map to RouteError::NoWorkloadForHost -> 503, got {status}"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("1"),
+        "a retryable routing failure must carry Retry-After"
     );
 
     Ok(())
@@ -359,7 +374,7 @@ async fn test_dynamic_router_unknown_host_returns_404() -> Result<()> {
 
 /// Stopping a workload must remove *all* of its routes — the primary host and
 /// every alias — not just the primary hostname. After unbind, a request to any
-/// former alias must map to `RouteError::NoWorkloadForHost` (404).
+/// former alias must map to `RouteError::NoWorkloadForHost` (503).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_dynamic_router_aliases_removed_on_unbind() -> Result<()> {
     let (addr, host) = start_host_with_dynamic_router("127.0.0.1:0").await?;
@@ -388,13 +403,13 @@ async fn test_dynamic_router_aliases_removed_on_unbind() -> Result<()> {
     host.workload_stop(WorkloadStopRequest { workload_id })
         .await?;
 
-    // After unbind, every former route — primary and aliases — must 404.
+    // After unbind, every former route — primary and aliases — must 503.
     for hostname in std::iter::once(primary).chain(aliases) {
         let status = get_status(&client, addr, hostname).await?;
         assert_eq!(
             status,
-            reqwest::StatusCode::NOT_FOUND,
-            "{hostname} must be removed on unbind and return 404, got {status}"
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "{hostname} must be removed on unbind and return 503, got {status}"
         );
     }
 

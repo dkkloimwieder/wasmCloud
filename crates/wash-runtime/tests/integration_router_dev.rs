@@ -60,9 +60,9 @@ fn http_handler_p2_request(host_header: &str) -> WorkloadStartRequest {
 }
 
 /// `DevRouter` with no bound workload reports `RouteError::NoWorkloadForHost("")`,
-/// which `handle_http_request` maps to 404.
+/// which `handle_http_request` maps to 503.
 fn is_unrouted(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::NOT_FOUND
+    status == reqwest::StatusCode::SERVICE_UNAVAILABLE
 }
 
 /// With A and B both registered, DevRouter routes to last-resolved B;
@@ -158,7 +158,7 @@ async fn test_dev_router_unbind_clears_only_matching() -> Result<()> {
     );
 
     // Stopping B clears the binding so subsequent requests are rejected by
-    // the router (404 Not Found via RouteError::NoWorkloadForHost).
+    // the router (503 Service Unavailable via RouteError::NoWorkloadForHost).
     host.workload_stop(WorkloadStopRequest { workload_id: id_b })
         .await?;
     let status = get_status(&client, addr, "whatever").await?;

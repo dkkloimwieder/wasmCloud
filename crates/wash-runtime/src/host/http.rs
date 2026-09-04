@@ -124,7 +124,17 @@ pub enum RouteError {
     MissingHost,
     /// No workload is currently bound to the host.
     /// `DynamicRouter` passes the offending host header; `DevRouter` is
-    /// host-agnostic and passes an empty string. Maps to 404.
+    /// host-agnostic and passes an empty string. Maps to 503 with `Retry-After`.
+    ///
+    /// 503 RATHER THAN 404, because a host is unbound for two reasons this
+    /// layer cannot tell apart, and only one of them is permanent. A workload
+    /// is rebound after every host restart, rolling update and reschedule, and
+    /// the routing layer above (an operator-managed EndpointSlice, an ingress)
+    /// keeps sending traffic to the host throughout that window. Answering 404
+    /// there tells a client "no such route" about a route that exists and is
+    /// about to serve again, and a client treats 404 as an answer while it
+    /// retries a 503. The cost is that a genuinely wrong `Host` header also
+    /// gets a retryable 503; that is the cheaper error of the two.
     NoWorkloadForHost(String),
     /// Router is momentarily unable to read its routing table (lock
     /// contention under heavy load). Retrying should succeed. Maps to 503.
@@ -136,8 +146,17 @@ impl RouteError {
     pub fn status(&self) -> u16 {
         match self {
             Self::MissingHost => 400,
-            Self::NoWorkloadForHost(_) => 404,
-            Self::Unavailable => 503,
+            Self::NoWorkloadForHost(_) | Self::Unavailable => 503,
+        }
+    }
+
+    /// Seconds a client should wait before retrying, when the condition is
+    /// transient. `None` when retrying the same request cannot help.
+    pub fn retry_after_seconds(&self) -> Option<u32> {
+        match self {
+            // A malformed request is malformed however long the client waits.
+            Self::MissingHost => None,
+            Self::NoWorkloadForHost(_) | Self::Unavailable => Some(1),
         }
     }
 }
@@ -1629,6 +1648,19 @@ fn error_response(status: u16) -> hyper::Response<HyperOutgoingBody> {
         .expect("building HTTP response with valid status code should never fail")
 }
 
+/// A routing failure as a response, carrying `Retry-After` when the condition
+/// is transient so a client and any proxy between it and here can tell a wait
+/// from a verdict.
+fn route_error_response(error: &RouteError) -> hyper::Response<HyperOutgoingBody> {
+    let mut builder = hyper::Response::builder().status(error.status());
+    if let Some(seconds) = error.retry_after_seconds() {
+        builder = builder.header(hyper::header::RETRY_AFTER, seconds);
+    }
+    builder
+        .body(HyperOutgoingBody::default())
+        .expect("building HTTP response with valid status code should never fail")
+}
+
 /// Handle individual HTTP requests by looking up workload and invoking component
 ///
 /// HTTP request attributes are emitted under both the current-stable OTel HTTP
@@ -1678,7 +1710,7 @@ async fn handle_http_request<T: Router>(
         Ok(id) => id,
         Err(e) => {
             warn!(err = %e, "failed to route incoming request");
-            let resp = error_response(e.status());
+            let resp = route_error_response(&e);
             record_response_status(&resp);
             return Ok(resp);
         }
@@ -1759,8 +1791,12 @@ async fn handle_http_request<T: Router>(
             }
         }
         None => {
+            // The router already resolved a workload id for this host, so the
+            // route exists; only its handle is missing, which is what a rebind
+            // window looks like from here. Retryable, for the reason spelled out
+            // on RouteError::NoWorkloadForHost.
             warn!(host = %workload_id, "No workload bound to host header or wildcard '*'");
-            error_response(404)
+            route_error_response(&RouteError::NoWorkloadForHost(workload_id.to_string()))
         }
     };
 
