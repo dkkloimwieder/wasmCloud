@@ -1706,7 +1706,11 @@ async fn handle_http_request<T: Router>(
         tracing::Span::current().record(SERVER_PORT, port);
     }
 
-    let workload_id = match handler.route_incoming_request(&req) {
+    let routed = {
+        let _span = tracing::info_span!("http.route").entered();
+        handler.route_incoming_request(&req)
+    };
+    let workload_id = match routed {
         Ok(id) => id,
         Err(e) => {
             warn!(err = %e, "failed to route incoming request");
@@ -1725,7 +1729,12 @@ async fn handle_http_request<T: Router>(
 
     // If this workload's long-lived service serves HTTP, deliver the request to
     // it (preserving its in-memory state) instead of the per-request path.
-    let service_sender = service_handlers.read().await.get(&workload_id).cloned();
+    let service_sender = service_handlers
+        .read()
+        .instrument(tracing::info_span!("http.lookup_service"))
+        .await
+        .get(&workload_id)
+        .cloned();
     if let Some(sender) = service_sender {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         // The deadline is enforced here, outside the service's store: a guest
@@ -1765,7 +1774,10 @@ async fn handle_http_request<T: Router>(
 
     // Look up workload handle for this host, with wildcard fallback
     let workload_handle = {
-        let handles = workload_handles.read().await;
+        let handles = workload_handles
+            .read()
+            .instrument(tracing::info_span!("http.lookup_workload"))
+            .await;
         debug!(host = %workload_id, "looking up workload handle for host header");
         handles.get(&workload_id).cloned()
     };
@@ -2082,7 +2094,10 @@ async fn invoke_component_handler(
     // The p2 path still builds and instantiates per request: its store is
     // owned by a detached task that outlives the response head, so recovering
     // it for reuse needs a restructure the p3 path did not.
-    let store = workload_handle.new_store(component_id).await?;
+    let store = workload_handle
+        .new_store(component_id)
+        .instrument(tracing::info_span!("http.new_store"))
+        .await?;
     handle_component_request(store, instance_pre, req, fuel_meter).await
 }
 
@@ -2111,11 +2126,15 @@ pub async fn handle_component_request(
         .unwrap_or_default();
     let uri = req.uri().to_string();
 
-    let req = store.data_mut().http().new_incoming_request(scheme, req)?;
-    let out = store.data_mut().http().new_response_outparam(sender)?;
-    let pre = ProxyPre::new(pre)
-        .map_err(anyhow::Error::from)
-        .context("failed to instantiate proxy pre")?;
+    let (req, out, pre) = {
+        let _build = tracing::info_span!("http.incoming_request").entered();
+        let req = store.data_mut().http().new_incoming_request(scheme, req)?;
+        let out = store.data_mut().http().new_response_outparam(sender)?;
+        let pre = ProxyPre::new(pre)
+            .map_err(anyhow::Error::from)
+            .context("failed to instantiate proxy pre")?;
+        (req, out, pre)
+    };
 
     // The deadline is enforced below, outside the store, where a non-yielding
     // guest cannot block it (see `crate::engine::abandon`).
@@ -2130,7 +2149,10 @@ pub async fn handle_component_request(
             // Watched for as long as the store runs guest code.
             let _abandoned = watch_guard;
             // Run the http request itself by instantiating and calling the component
-            let proxy = pre.instantiate_async(&mut store).await?;
+            let proxy = pre
+                .instantiate_async(&mut store)
+                .instrument(tracing::info_span!("http.instantiate"))
+                .await?;
 
             fuel_meter
                 .observe(
@@ -2145,6 +2167,7 @@ pub async fn handle_component_request(
                         proxy
                             .wasi_http_incoming_handler()
                             .call_handle(store, req, out)
+                            .instrument(tracing::info_span!("http.handle"))
                             .await?;
 
                         Ok(())
@@ -2152,12 +2175,20 @@ pub async fn handle_component_request(
                 )
                 .await?;
 
+            // The store's teardown is a host call too: the pooling allocator
+            // takes the instance slot back here, after the head has gone out.
+            let _teardown = tracing::info_span!("http.store_drop").entered();
+            drop(store);
             Ok(())
         }
         .in_current_span(),
     );
 
-    match call.await_head(receiver).await {
+    match call
+        .await_head(receiver)
+        .instrument(tracing::info_span!("http.await_head"))
+        .await
+    {
         // If the client calls `response-outparam::set` then one of these
         // methods will be called.
         Some((Ok(Ok(resp)), watch)) => Ok(watch_body(resp, watch)),
