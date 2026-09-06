@@ -141,21 +141,25 @@ async fn test_secret_survives_other_workload_stop() -> Result<()> {
         "stopping another workload must not disturb this one"
     );
 
-    // The stopped workload is no longer routable (poll: teardown is async).
+    // The stopped workload is no longer served (poll: teardown is async). Its
+    // host is still routable but has no workload behind it, and that answers
+    // 503 with Retry-After rather than 404: a caller retries a 503 and treats
+    // a 404 as an answer, and the same shape is a rebind window after a host
+    // restart (the NoWorkloadForHost change in host/http.rs).
     let mut stopped_status = 0;
     for _ in 0..40 {
         stopped_status = req(&client, &addr, "secrets-stop", "/get?key=registry-username")
             .await?
             .0
             .as_u16();
-        if stopped_status == 404 {
+        if stopped_status == 503 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(
-        stopped_status, 404,
-        "a stopped workload is no longer routable"
+        stopped_status, 503,
+        "a stopped workload answers 503 Retry-After until its route is unbound"
     );
 
     Ok(())
