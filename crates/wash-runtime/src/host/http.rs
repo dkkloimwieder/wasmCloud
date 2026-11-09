@@ -2547,10 +2547,8 @@ impl<T: Router, O: OutgoingHandler> HostHandler for Ingress<T, O> {
         Ok(())
     }
 
-    /// Ends the accept loop, and lets go of the routing tables once the drain
-    /// it starts has finished — not before, because connections already
-    /// established are served from their own handles on those tables, and
-    /// emptying them here would 404 every request still arriving over one.
+    /// Ends the accept loop and retires connections after admitted responses finish.
+    /// Retains the routing tables until those connections finish draining.
     async fn stop(&self) -> anyhow::Result<()> {
         info!(addr = ?self.addr, "HTTP server stopping");
         // Scoped, so the release below is arranged without this guard held
@@ -3111,6 +3109,9 @@ async fn run_http_server<T: Router>(
                         let tls_acceptor_clone = tls_acceptor.clone();
                         let handler_clone = handler.clone();
                         let guest_meter = guest_meter.clone();
+                        // Accept-loop exit retires idle connections and lets
+                        // each admitted response finish before it closes.
+                        let mut stopping = connections.stopped.subscribe();
                         // What a guest is told it was reached over: this
                         // listener's own scheme, not a header a client can set.
                         let client_scheme = if tls_acceptor.is_some() {
@@ -3169,9 +3170,17 @@ async fn run_http_server<T: Router>(
                                         Ok(())
                                     }
                                     Ok(Ok(tls_stream)) => {
-                                        builder
-                                            .serve_connection_with_upgrades(TokioIo::new(tls_stream), service)
-                                            .await
+                                        let connection = builder
+                                            .serve_connection_with_upgrades(TokioIo::new(tls_stream), service);
+                                        tokio::pin!(connection);
+                                        tokio::select! {
+                                            biased;
+                                            _ = async { let _ = stopping.wait_for(|stopped| *stopped).await; } => {
+                                                connection.as_mut().graceful_shutdown();
+                                                connection.await
+                                            }
+                                            result = &mut connection => result,
+                                        }
                                     }
                                     Ok(Err(e)) => {
                                         error!(addr = ?client_addr, err = ?e, "TLS handshake failed");
@@ -3180,9 +3189,17 @@ async fn run_http_server<T: Router>(
                                 }
                             } else {
                                 // Handle HTTP/h2c connection
-                                builder
-                                    .serve_connection_with_upgrades(TokioIo::new(client), service)
-                                    .await
+                                let connection = builder
+                                    .serve_connection_with_upgrades(TokioIo::new(client), service);
+                                tokio::pin!(connection);
+                                tokio::select! {
+                                    biased;
+                                    _ = async { let _ = stopping.wait_for(|stopped| *stopped).await; } => {
+                                        connection.as_mut().graceful_shutdown();
+                                        connection.await
+                                    }
+                                    result = &mut connection => result,
+                                }
                             }
                             };
 
